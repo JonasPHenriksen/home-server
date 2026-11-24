@@ -1,0 +1,5 @@
+# /home/desktop/.ssh/authorized_keys on the laptop, owned by root.
+# The desktop's job (dietpi-backup-sync.sh, run as root there) logs in as
+# `desktop`. Its key can do only what `backup-gate push` allows, and the gate
+# accepts it only from the desktop, 192.168.50.20 (dropbear has no from=).
+restrict,command="/usr/local/bin/backup-gate push" ssh-ed25519 AAAA...example-public-key... desktop job

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily check that the backup server is still running cycles
+
+[Timer]
+OnCalendar=*-*-* 10:00
+# Catch up after the machine has been off, rather than silently skipping.
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

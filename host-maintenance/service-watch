@@ -1,0 +1,389 @@
+#!/bin/bash
+#
+# service-watch - push a notification when a service, DNS, Tailscale, a
+# container or the disk breaks, once more when it is fixed, and after an
+# unexpected shutdown.
+#
+# The login summary shows all of this, but only when someone logs in. This
+# runs the same checks every two minutes (service-watch.timer) and pushes
+# through ntfy-notify:
+#
+#   * a problem once it has been seen on AFTER runs in a row (two by default,
+#     so a service restarting itself or one slow DNS answer is not news), in a
+#     single push however many things broke at once;
+#   * once when it is over, and only for problems that were pushed;
+#   * once after an unexpected shutdown - a power cut
+#     or a hard freeze. service-watch-shutdown.service marks every
+#     clean shutdown, so the first run after boot can tell the two apart.
+#
+# A check that depends on something already reported is skipped rather than
+# reported twice: no DNS checks while pihole-FTL itself is down, no container
+# checks while Docker is down, no unbound or Tailscale checks while the
+# internet is down. Nothing is checked while maintenance runs (the weekly or
+# daily job, dietpi-backup, dietpi-update, apt): those stop and restart
+# services on purpose.
+#
+#   service-watch              one round of checks (the timer)
+#   service-watch --status     what the checks see right now and what is pending; never pushes
+#   service-watch --shutdown   mark this shutdown as clean (service-watch-shutdown.service)
+#
+# State: $STATE_DIR (problems.tsv, alive, clean-shutdown). Log: one line per
+# change in $LOG, nothing on quiet runs. Always exits 0 after a round of checks:
+# problems are reported by push, not by a failed unit.
+#
+# Environment (tests): STATE_DIR, LOG, NOTIFY, NOW, BOOT_TIME, and PATH for
+# fake systemctl, docker, dig, tailscale, ping, df and pgrep.
+
+set -u
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+export LC_ALL=C.UTF-8   # English dates in the pushes and predictable command output, whatever the locale
+
+STATE_DIR="${STATE_DIR:-/var/lib/service-watch}"
+LOG="${LOG:-/mnt/dietpi_userdata/logs/service-watch.log}"
+NOTIFY="${NOTIFY:-/usr/local/bin/ntfy-notify}"
+
+# The same list as the login summary; a test keeps the two equal.
+SERVICES=(pihole-FTL unbound tailscaled docker dropbear ufw cam_recorder tapo_presence status_page earlyoom smartmontools)
+CONTAINERS=(metube metube-login ntfy)   # expected to exist and run; add new ones here
+DISK_MIN_FREE_GB=10          # the recorder already warns below 20 GB, after deleting old recordings
+BLOCKED_TEST_DOMAIN=ad.doubleclick.net
+RESOLVE_TEST_DOMAIN=dietpi.com
+INTERNET_TEST_IPS=(9.9.9.9 1.1.1.1)
+
+# Runs in a row (two minutes apart) a problem must be seen before it is pushed.
+AFTER_DEFAULT=2
+AFTER_NETWORK=3      # internet and Tailscale: short outages happen
+AFTER_BLOCKING=15    # "disable blocking for 5 minutes" in Pi-hole is a normal thing to do
+
+# Maintenance that stops and starts services on purpose.
+MAINTENANCE_SCRIPTS='system-and-pihole-updater|cron\.daily/security-upgrades|/boot/dietpi/dietpi-(backup|update|software)'
+MAINTENANCE_PROCS='apt|apt-get|dpkg'
+
+now=${NOW:-$(date +%s)}
+
+# --------------------------------------------------------------------------- helpers
+
+log() { echo "$(date -u '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG" 2>/dev/null; }
+at()  { date -u -d "@$1" '+%H:%M UTC'; }
+day() { date -u -d "@$1" '+%a %d %b %H:%M UTC'; }
+
+# "12 min", "3 h 5 min", "2 d 4 h"
+took() {
+    local s=$(( $1 < 60 ? 60 : $1 ))
+    if [ "$s" -lt 3600 ]; then echo "$(( s / 60 )) min"
+    elif [ "$s" -lt 86400 ]; then echo "$(( s / 3600 )) h $(( s % 3600 / 60 )) min"
+    else echo "$(( s / 86400 )) d $(( s % 86400 / 3600 )) h"; fi
+}
+
+# send PRIORITY TAGS TITLE BODY; succeeds when ntfy-notify sent or held it
+send() {
+    if [ ! -x "$NOTIFY" ]; then
+        log "WARNING: $NOTIFY not executable, cannot notify: $3"
+        return 1
+    fi
+    if "$NOTIFY" -p "$1" -t "$2" "$3" "$4" >/dev/null 2>&1; then
+        log "notified: $3"
+    else
+        log "WARNING: ntfy-notify failed for: $3 (retried next run)"
+        return 1
+    fi
+}
+
+maintenance_running() {
+    pgrep -f "$MAINTENANCE_SCRIPTS" >/dev/null 2>&1 || pgrep -x "$MAINTENANCE_PROCS" >/dev/null 2>&1
+}
+
+# Where to look first, by kind of problem.
+hint() {
+    case "$1" in
+        service:*)   echo "systemctl status ${1#service:}" ;;
+        failed:*)    echo "systemctl status ${1#failed:}" ;;
+        container:*) echo "docker logs --tail 50 ${1#container:}" ;;
+        dns:unbound) echo "systemctl status unbound" ;;
+        dns:*)       echo "pihole status" ;;
+        tailscale)   echo "tailscale status" ;;
+        disk:*)      echo "du -xh / 2>/dev/null | sort -h | tail -20" ;;
+        internet)    echo "the router, or the provider" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------- state
+
+# Known problems, one per line: KEY COUNT PUSHED SINCE LABEL TEXT (tab separated).
+# COUNT is the number of runs in a row it has been seen, SINCE when it was first seen.
+declare -A S_COUNT=() S_PUSHED=() S_SINCE=() S_LABEL=() S_TEXT=()
+
+load_state() {
+    local key count pushed since label text
+    [ -r "$STATE_DIR/problems.tsv" ] || return 0
+    while IFS=$'\t' read -r key count pushed since label text; do
+        [ -n "$key" ] || continue
+        S_COUNT[$key]=$count S_PUSHED[$key]=$pushed S_SINCE[$key]=$since S_LABEL[$key]=$label S_TEXT[$key]=$text
+    done < "$STATE_DIR/problems.tsv"
+}
+
+save_state() {
+    local key tmp="$STATE_DIR/problems.tsv.tmp"
+    : > "$tmp"
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "${S_COUNT[$key]}" "${S_PUSHED[$key]:-0}" \
+            "${S_SINCE[$key]}" "${S_LABEL[$key]}" "${S_TEXT[$key]}" >> "$tmp"
+    done < <(printf '%s\n' "${!S_COUNT[@]}" | sort)
+    mv -f "$tmp" "$STATE_DIR/problems.tsv"
+}
+
+forget() { unset "S_COUNT[$1]" "S_PUSHED[$1]" "S_SINCE[$1]" "S_LABEL[$1]" "S_TEXT[$1]"; }
+
+# --------------------------------------------------------------------------- checks
+
+# What this round found: BAD[key]=text (with LABEL and AFTER), OK[key]=1.
+# A key in neither was not checked this round and keeps its state.
+declare -A BAD=() OK=() LABEL=() AFTER=() SVC=()
+INTERNET=unknown
+
+bad() {  # bad KEY LABEL TEXT [AFTER]
+    local text="${3//$'\t'/ }"
+    BAD[$1]="${text//$'\n'/ }" LABEL[$1]="$2" AFTER[$1]="${4:-$AFTER_DEFAULT}"
+}
+ok() { OK[$1]=1; }
+
+check_internet() {
+    local ip
+    for ip in "${INTERNET_TEST_IPS[@]}"; do
+        if ping -c 1 -W 2 -q "$ip" >/dev/null 2>&1; then INTERNET=up; ok internet; return; fi
+    done
+    INTERNET=down
+    bad internet "Internet" "No internet connection (${INTERNET_TEST_IPS[*]} do not answer)" "$AFTER_NETWORK"
+}
+
+check_services() {
+    local -a states
+    local s i=0
+    mapfile -t states < <(systemctl is-active "${SERVICES[@]}" 2>/dev/null)
+    # one line per unit; anything else means systemctl itself is in trouble
+    [ "${#states[@]}" -eq "${#SERVICES[@]}" ] || return 0
+    for s in "${SERVICES[@]}"; do
+        SVC[$s]=${states[$i]:-unknown}
+        case "${SVC[$s]}" in
+            active)     ok "service:$s" ;;
+            failed)     bad "service:$s" "$s" "$s has failed" ;;
+            activating) bad "service:$s" "$s" "$s keeps restarting" ;;
+            inactive)   bad "service:$s" "$s" "$s is stopped" ;;
+            *)          bad "service:$s" "$s" "$s is ${SVC[$s]}" ;;
+        esac
+        i=$((i + 1))
+    done
+}
+
+# Failed units other than the services above, which report themselves.
+check_failed_units() {
+    local unit key
+    local -A failed=()
+    while read -r unit _; do
+        [ -n "$unit" ] || continue
+        [ -n "${SVC[${unit%.service}]:-}" ] && continue
+        failed[$unit]=1
+        bad "failed:$unit" "$unit" "$unit has failed"
+    done < <(systemctl --failed --no-legend --plain 2>/dev/null)
+    for key in "${!S_COUNT[@]}"; do
+        [[ $key == failed:* ]] && [ -z "${failed[${key#failed:}]:-}" ] && ok "$key"
+    done
+}
+
+check_containers() {
+    [ "${SVC[docker]:-}" = active ] || return 0
+    local out c status
+    out=$(timeout 10 docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null) || return 0
+    # login-summary runs as dietpi, which is not in the docker group: leave it the list.
+    printf '%s\n' "$out" > "$STATE_DIR/containers.tsv.new" && mv -f "$STATE_DIR/containers.tsv.new" "$STATE_DIR/containers.tsv"
+    for c in "${CONTAINERS[@]}"; do
+        status=$(awk -F'\t' -v n="$c" '$1 == n {print $2; exit}' <<< "$out")
+        if [ -z "$status" ]; then bad "container:$c" "$c container" "The $c container is missing"
+        elif [[ $status != Up* ]]; then bad "container:$c" "$c container" "The $c container is down ($status)"
+        elif [[ $status == *unhealthy* ]]; then bad "container:$c" "$c container" "The $c container is unhealthy"
+        else ok "container:$c"; fi
+    done
+}
+
+check_dns() {
+    local a
+    if [ "${SVC[pihole-FTL]:-}" = active ]; then
+        a=$(timeout 5 dig +short +time=2 +tries=1 @127.0.0.1 "$BLOCKED_TEST_DOMAIN" A 2>/dev/null | head -n 1)
+        if [ -z "$a" ]; then
+            bad dns:answer "Pi-hole DNS" "Pi-hole is not answering DNS queries"
+        else
+            ok dns:answer
+            if [ "$a" = 0.0.0.0 ] || [ "$a" = "::" ]; then ok dns:blocking
+            else bad dns:blocking "Pi-hole blocking" "Pi-hole is not blocking ads ($BLOCKED_TEST_DOMAIN -> $a)" "$AFTER_BLOCKING"; fi
+        fi
+    fi
+    if [ "${SVC[unbound]:-}" = active ] && [ "$INTERNET" = up ]; then
+        a=$(timeout 5 dig +short +time=2 +tries=1 @127.0.0.1 -p 5335 "$RESOLVE_TEST_DOMAIN" A 2>/dev/null | head -n 1)
+        if [ -n "$a" ]; then ok dns:unbound
+        else bad dns:unbound "unbound" "unbound is not resolving names, though the internet is up"; fi
+    fi
+}
+
+check_tailscale() {
+    [ "${SVC[tailscaled]:-}" = active ] && [ "$INTERNET" = up ] || return 0
+    local json state online
+    json=$(timeout 5 tailscale status --json 2>/dev/null)
+    state=$(awk -F'"' '/"BackendState":/ {print $4; exit}' <<< "$json")
+    online=$(awk '/"Self":/ {s=1} s && /"Online":/ {gsub(/[ ,]/, "", $2); print $2; exit}' <<< "$json")
+    if [ "$state" = Running ] && [ "$online" = true ]; then ok tailscale
+    elif [ "$state" = Running ]; then bad tailscale "Tailscale" "Tailscale is not connected to the tailnet" "$AFTER_NETWORK"
+    else bad tailscale "Tailscale" "Tailscale is ${state:-not answering}" "$AFTER_NETWORK"; fi
+}
+
+check_disk() {
+    local free
+    free=$(df --output=avail -B1G / 2>/dev/null | tail -n 1 | tr -d ' ')
+    [[ $free =~ ^[0-9]+$ ]] || return 0
+    if [ "$free" -lt "$DISK_MIN_FREE_GB" ]; then bad disk:/ "Disk /" "The disk is almost full: $free GB free on /"
+    else ok disk:/; fi
+}
+
+run_checks() {
+    check_internet
+    check_services
+    check_failed_units
+    check_containers
+    check_dns
+    check_tailscale
+    check_disk
+}
+
+# --------------------------------------------------------------------------- restarts
+
+# First run after a boot: was the shutdown before it a clean one?
+check_restart() {
+    local boot alive clean=0
+    [ -e "$STATE_DIR/alive" ] || return 0       # first run ever: nothing to compare with
+    boot=${BOOT_TIME:-$(awk '/^btime/ {print $2}' /proc/stat)}
+    alive=$(stat -c %Y "$STATE_DIR/alive")
+    [ "$alive" -lt "$boot" ] || return 0        # not the first run since this boot
+    if [ -e "$STATE_DIR/clean-shutdown" ] && [ "$(stat -c %Y "$STATE_DIR/clean-shutdown")" -ge "$alive" ]; then
+        clean=1
+    fi
+    rm -f "$STATE_DIR/clean-shutdown"
+    if [ "$clean" = 1 ]; then
+        log "booted after a clean shutdown"
+        return 0
+    fi
+    log "booted after an UNEXPECTED shutdown, last seen running $(day "$alive")"
+    send high electric_plug "Restarted after an unexpected shutdown" \
+        "Last seen running $(day "$alive"), up again since $(day "$boot"). There was no clean shutdown in between: a power cut or a hard freeze."
+}
+
+# --------------------------------------------------------------------------- pushes
+
+# Count this round's findings into the state and push what changed.
+report() {
+    local key since
+    local -a new=() fixed=()
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        [ -z "${S_COUNT[$key]:-}" ] && log "seen: ${BAD[$key]}"
+        S_COUNT[$key]=$(( ${S_COUNT[$key]:-0} + 1 ))
+        S_SINCE[$key]=${S_SINCE[$key]:-$now}
+        S_LABEL[$key]=${LABEL[$key]}
+        S_TEXT[$key]=${BAD[$key]}
+        if [ "${S_PUSHED[$key]:-0}" != 1 ] && [ "${S_COUNT[$key]}" -ge "${AFTER[$key]}" ]; then
+            new+=("$key")
+        fi
+    done < <(printf '%s\n' "${!BAD[@]}" | sort)
+    while IFS= read -r key; do
+        [ -n "$key" ] && [ -n "${S_COUNT[$key]:-}" ] || continue
+        if [ "${S_PUSHED[$key]:-0}" = 1 ]; then
+            fixed+=("$key")
+        else
+            log "cleared before it was pushed: ${S_TEXT[$key]}"
+            forget "$key"
+        fi
+    done < <(printf '%s\n' "${!OK[@]}" | sort)
+
+    if [ "${#new[@]}" -gt 0 ]; then
+        local title body=""
+        if [ "${#new[@]}" -eq 1 ]; then
+            key=${new[0]}
+            title=${S_TEXT[$key]}
+            body="Since $(at "${S_SINCE[$key]}"). Look: $(hint "$key")"
+        else
+            title="${#new[@]} problems"
+            for key in "${new[@]}"; do
+                body+="${body:+$'\n'}- ${S_TEXT[$key]} (since $(at "${S_SINCE[$key]}"))"
+            done
+        fi
+        if send high warning "$title" "$body"; then
+            for key in "${new[@]}"; do S_PUSHED[$key]=1; done
+        fi
+    fi
+
+    if [ "${#fixed[@]}" -gt 0 ]; then
+        local title body=""
+        if [ "${#fixed[@]}" -eq 1 ]; then
+            key=${fixed[0]} since=${S_SINCE[${fixed[0]}]}
+            title="${S_LABEL[$key]} is OK again"
+            body="Was: ${S_TEXT[$key]}. For $(took $(( now - since ))), since $(at "$since")."
+        else
+            title="${#fixed[@]} problems fixed"
+            for key in "${fixed[@]}"; do
+                since=${S_SINCE[$key]}
+                body+="${body:+$'\n'}- ${S_LABEL[$key]} OK again after $(took $(( now - since )))"
+            done
+        fi
+        if send low white_check_mark "$title" "$body"; then
+            for key in "${fixed[@]}"; do
+                since=${S_SINCE[$key]}
+                log "fixed: ${S_TEXT[$key]} (after $(took $(( now - since ))))"
+                forget "$key"
+            done
+        fi
+    fi
+}
+
+status() {
+    local key
+    maintenance_running && echo "maintenance is running: the timer's rounds are skipped until it ends"
+    [ -e "$STATE_DIR/alive" ] && echo "last round: $(day "$(stat -c %Y "$STATE_DIR/alive")")"
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        if [ -n "${BAD[$key]:-}" ]; then
+            printf 'PROBLEM  %-24s %s (seen %s time(s), pushed: %s)\n' "$key" "${BAD[$key]}" \
+                "$(( ${S_COUNT[$key]:-0} + 1 ))" "$([ "${S_PUSHED[$key]:-0}" = 1 ] && echo yes || echo no)"
+        elif [ -n "${OK[$key]:-}" ]; then
+            printf 'ok       %s\n' "$key"
+        else
+            printf 'skipped  %-24s (depends on something that is down)\n' "$key"
+        fi
+    done < <(printf '%s\n' "${!BAD[@]}" "${!OK[@]}" "${!S_COUNT[@]}" | sort -u)
+}
+
+# --------------------------------------------------------------------------- main
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+case "${1:-}" in
+    --shutdown)
+        touch "$STATE_DIR/clean-shutdown"
+        exit 0
+        ;;
+    --status)
+        load_state
+        run_checks
+        status
+        exit 0
+        ;;
+esac
+
+check_restart
+if maintenance_running; then
+    touch "$STATE_DIR/alive"
+    exit 0
+fi
+load_state
+run_checks
+report
+save_state
+touch "$STATE_DIR/alive"
+exit 0

@@ -1,0 +1,17 @@
+# ntfy-notify configuration. Install as /etc/ntfy-notify.conf, readable only by
+# the users that send notifications (root and dietpi on the laptop).
+#
+# Create the token on the laptop with:
+#   docker exec ntfy ntfy token add --label <where> notifier
+NTFY_URL=http://127.0.0.1:8082
+# A long random topic: ntfy.sh's relay channel is a hash of base-url and topic.
+NTFY_TOPIC=replace-with-a-random-topic
+NTFY_TOKEN=tk_replace_me
+
+# The phone that carries the ntfy app. While it is not on the home network a
+# message is held in the spool instead of being sent, because the phone could
+# not fetch its text from here anyway; ntfy-spool-flush.timer sends it once the
+# phone is back. Leave empty to always send immediately, which is right for a
+# machine that is only awake now and then.
+NTFY_PHONE_IP=
+NTFY_SPOOL_DIR=/var/spool/ntfy-notify

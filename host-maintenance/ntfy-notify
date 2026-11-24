@@ -1,0 +1,357 @@
+#!/bin/bash
+#
+# ntfy-notify - send one push notification through the local ntfy server,
+# or hold it until the phone is back on the home network.
+#
+#   ntfy-notify [-p PRIORITY] [-t TAGS] [-T TOPIC] [-c URL] TITLE [MESSAGE...]
+#   ntfy-notify --flush     send everything held, if the phone is home (timer)
+#   ntfy-notify --status    how many messages are held, and since when
+#
+#   PRIORITY  min | low | default | high | urgent (or 1-5); default "default"
+#   TAGS      comma separated ntfy tags (emoji shortcodes like warning, or words);
+#             the host name is always added
+#   TOPIC     override the topic from the config file
+#   URL       "click" URL opened when the notification is tapped
+#   MESSAGE   the body; read from stdin when omitted or "-"
+#
+# Why hold anything: the ntfy server is only reachable on the home network, on
+# purpose. A message published while the phone is away still reaches it through
+# Apple, but the phone cannot fetch the text, so it shows a useless "New
+# message" and is never retried. So when the phone is not on the network the
+# message is written to the spool directory instead, and the flush timer sends
+# it for real once the phone is back. Each held message carries the time it was
+# raised, appended to its body.
+#
+# Holding is active only when NTFY_PHONE_IP is set and the spool directory
+# exists and is writable. Otherwise every message is sent straight away, which
+# is what the backup server does: it is awake once a week, so a message held
+# there would wait a week.
+#
+# Configuration, KEY=VALUE lines (the file is read, never sourced):
+#   /etc/ntfy-notify.conf, or the file named by $NTFY_NOTIFY_CONF
+#     NTFY_URL        server, e.g. http://127.0.0.1:8082
+#     NTFY_TOPIC      topic, e.g. home-q7x2m9 (random: see the README)
+#     NTFY_TOKEN      access token of a user allowed to publish there
+#     NTFY_PHONE_IP   the phone that carries the ntfy app; empty = send always
+#     NTFY_SPOOL_DIR  where held messages wait (default /var/spool/ntfy-notify)
+#
+# Exit codes: 0 sent or held, 1 usage or configuration problem, 2 the message
+# was neither sent nor held. It never hangs (10 s per attempt, two retries) and
+# prints nothing on success, so callers can fire and forget.
+#
+# NTFY_NOTIFY_DRY_RUN=1 prints the request instead of sending or holding it.
+
+set -u
+export PATH="$PATH:/usr/sbin:/sbin"   # ip lives in /usr/sbin
+
+CONF="${NTFY_NOTIFY_CONF:-/etc/ntfy-notify.conf}"
+CURL="${NTFY_NOTIFY_CURL:-curl}"
+PHONE_PORT=62078          # iPhones keep this open even asleep
+ARP_WAIT="${NTFY_NOTIFY_ARP_WAIT:-9}"   # seconds to let an unconfirmed neighbour resolve
+SPOOL_MAX_AGE=$((7 * 86400))   # older held messages are dropped, not sent
+SPOOL_MAX_FILES=200            # hard cap, oldest dropped first
+
+usage() {
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# value of KEY from the config file; quotes around the value are stripped
+conf_value() {
+    local line
+    line=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CONF" 2>/dev/null | tail -1) || true
+    line="${line#*=}"
+    line="${line%"${line##*[![:space:]]}"}"   # trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"   # leading whitespace
+    line="${line%\"}"; line="${line#\"}"
+    line="${line%\'}"; line="${line#\'}"
+    printf '%s' "$line"
+}
+
+load_config() {
+    if [ ! -r "$CONF" ]; then
+        echo "ntfy-notify: cannot read $CONF" >&2
+        exit 1
+    fi
+    URL=$(conf_value NTFY_URL)
+    TOKEN=$(conf_value NTFY_TOKEN)
+    CONF_TOPIC=$(conf_value NTFY_TOPIC)
+    PHONE_IP=$(conf_value NTFY_PHONE_IP)
+    SPOOL_DIR=$(conf_value NTFY_SPOOL_DIR)
+    [ -n "$SPOOL_DIR" ] || SPOOL_DIR=/var/spool/ntfy-notify
+    if [ -z "$URL" ] || [ -z "$CONF_TOPIC" ] || [ -z "$TOKEN" ]; then
+        echo "ntfy-notify: NTFY_URL, NTFY_TOPIC and NTFY_TOKEN must all be set in $CONF" >&2
+        exit 1
+    fi
+}
+
+# Is the phone on the home network? A sleeping iPhone ignores ICMP completely,
+# but its wifi chip still answers ARP, so the kernel neighbour table is the real
+# test, exactly as the camera system's presence probe found.
+#
+# The catch is that the table has states that mean neither yes nor no. An entry
+# is REACHABLE for about 30 s after the phone last proved itself, then drops to
+# STALE: the address is still known, it just has not been confirmed lately.
+# Sending anything to a STALE entry moves it to DELAY and starts the kernel
+# probing, which takes delay_first_probe_time plus a few unicast retries, about
+# eight seconds here. Reading the table during that window and calling it
+# "away" was wrong, and made roughly one check in five hold a message that
+# could have gone straight out.
+#
+# So: take a confirmed entry immediately, then try to provoke an answer, then
+# wait out the kernel's own verdict. A phone that is really gone has no entry at
+# all, or a failed one, and is reported away at once.
+# No phone configured means "always present", i.e. never hold anything.
+phone_present() {
+    [ -n "$PHONE_IP" ] || return 0
+
+    # already confirmed within the last half minute: no packets needed
+    neigh_state | grep -q REACHABLE && return 0
+
+    # an answer to either of these is proof on its own, and both also make the
+    # kernel start resolving the neighbour entry
+    ping -c1 -W1 "$PHONE_IP" >/dev/null 2>&1 && return 0
+    timeout 1 bash -c "exec 3<>/dev/tcp/$PHONE_IP/$PHONE_PORT" 2>/dev/null && return 0
+
+    local waited=0 state
+    while :; do
+        state=$(neigh_state)
+        case "$state" in
+            *REACHABLE*)                    return 0 ;;
+            *STALE*|*DELAY*|*PROBE*)        ;;   # the kernel is still deciding
+            *)                              return 1 ;;   # FAILED, INCOMPLETE or no entry
+        esac
+        [ "$waited" -ge "$ARP_WAIT" ] && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+neigh_state() {
+    ip neigh show "$PHONE_IP" 2>/dev/null
+}
+
+holding_possible() {
+    [ -n "$PHONE_IP" ] && [ -d "$SPOOL_DIR" ] && [ -w "$SPOOL_DIR" ]
+}
+
+# send_now PRIORITY TAGS TITLE CLICK TOPIC BODY
+# 0 sent, 1 the server refused it for good (4xx), 2 it could not be delivered now
+send_now() {
+    local priority="$1" tags="$2" title="$3" click="$4" topic="$5" body="$6" code
+    local args=(-sS -o /dev/null -w '%{http_code}'
+                --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused
+                -H "Authorization: Bearer $TOKEN"
+                -H "Title: $title"
+                -H "Priority: $priority"
+                -H "Tags: $tags"
+                -H "Markdown: no")
+    [ -n "$click" ] && args+=(-H "Click: $click")
+    args+=(--data-binary @- "$URL/$topic")
+
+    code=$(printf '%s' "$body" | "$CURL" "${args[@]}" 2>/dev/null) || code="000"
+    case "$code" in
+        2*) return 0 ;;
+        4*) echo "ntfy-notify: $URL/$topic answered HTTP $code" >&2; return 1 ;;
+        *)  echo "ntfy-notify: $URL/$topic answered HTTP $code" >&2; return 2 ;;
+    esac
+}
+
+# hold PRIORITY TAGS TITLE CLICK TOPIC BODY
+#
+# The spool is writable by group dietpi, and the maintenance jobs hold as root.
+# So the temp file is created with noclobber (O_EXCL: a symlink planted under
+# that name makes the write fail instead of being followed) and a fixed umask,
+# so the dietpi flusher can always read it (the setgid folder makes it group
+# dietpi). The rename then moves whatever is under that name, never through it.
+hold() {
+    local file="$SPOOL_DIR/$(date +%s%N)-$$.msg"
+    ( umask 022; set -C
+      {
+        printf 'priority=%s\n' "$1"
+        printf 'tags=%s\n' "$2"
+        printf 'title=%s\n' "$3"
+        printf 'click=%s\n' "$4"
+        printf 'topic=%s\n' "$5"
+        printf 'created=%s\n' "$(date +%s)"
+        printf '\n'
+        printf '%s' "$6"
+      } > "$file.tmp" ) 2>/dev/null && mv "$file.tmp" "$file" 2>/dev/null || {
+        rm -f "$file.tmp" 2>/dev/null
+        return 1
+    }
+    prune_spool
+    return 0
+}
+
+# keep the spool bounded, oldest first (names sort chronologically)
+prune_spool() {
+    local files=("$SPOOL_DIR"/*.msg) n
+    [ -e "${files[0]}" ] || return 0
+    n=${#files[@]}
+    while [ "$n" -gt "$SPOOL_MAX_FILES" ]; do
+        rm -f "${files[0]}" 2>/dev/null
+        files=("${files[@]:1}")
+        n=$((n - 1))
+    done
+}
+
+# read one held message into sp_* variables
+read_held() {
+    local line in_body=0
+    sp_priority=default; sp_tags=""; sp_title=""; sp_click=""; sp_topic=""; sp_created=0; sp_body=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$in_body" = 0 ]; then
+            if [ -z "$line" ]; then in_body=1; continue; fi
+            case "$line" in
+                priority=*) sp_priority="${line#*=}" ;;
+                tags=*)     sp_tags="${line#*=}" ;;
+                title=*)    sp_title="${line#*=}" ;;
+                click=*)    sp_click="${line#*=}" ;;
+                topic=*)    sp_topic="${line#*=}" ;;
+                created=*)  sp_created="${line#*=}" ;;
+            esac
+        else
+            sp_body+="$line"$'\n'
+        fi
+    done < "$1"
+    sp_body="${sp_body%$'\n'}"
+    # It goes into $(( )), where bash would evaluate text such as PATH[$(cmd)].
+    # Not a number means a damaged or forged file: 0 makes it expire unsent.
+    [[ $sp_created =~ ^[0-9]+$ ]] || sp_created=0
+}
+
+flush() {
+    local files sent=0 dropped=0 now rc body note
+    files=("$SPOOL_DIR"/*.msg)
+    [ -e "${files[0]}" ] || return 0          # nothing held: no probe, no network
+
+    # Lock the folder itself: a lock file inside it could be swapped for a
+    # symlink by anyone in group dietpi, and opening it with > would truncate
+    # whatever the link points at.
+    exec 7<"$SPOOL_DIR" || return 0
+    flock -n 7 || return 0                    # another flush is already running
+
+    files=("$SPOOL_DIR"/*.msg)                # re-read, the other run may have sent some
+    [ -e "${files[0]}" ] || return 0
+
+    now=$(date +%s)
+    if ! phone_present; then
+        return 0
+    fi
+
+    for file in "${files[@]}"; do
+        [ -f "$file" ] || continue
+        read_held "$file"
+        if [ $((now - sp_created)) -gt "$SPOOL_MAX_AGE" ]; then
+            rm -f "$file"
+            dropped=$((dropped + 1))
+            continue
+        fi
+        note="(raised $(date -d "@$sp_created" '+%a %d %b %H:%M %Z' 2>/dev/null || echo "earlier"))"
+        body="${sp_body}${sp_body:+$'\n\n'}$note"
+        send_now "$sp_priority" "$sp_tags" "$sp_title" "$sp_click" "${sp_topic:-$CONF_TOPIC}" "$body"
+        rc=$?
+        if [ "$rc" = 0 ] || [ "$rc" = 1 ]; then
+            rm -f "$file"                     # sent, or refused for good: do not keep retrying
+            [ "$rc" = 0 ] && sent=$((sent + 1)) || dropped=$((dropped + 1))
+        else
+            break                             # server unreachable: leave the rest for next time
+        fi
+    done
+    [ "$sent" -gt 0 ] && echo "ntfy-notify: sent $sent held message(s)"
+    [ "$dropped" -gt 0 ] && echo "ntfy-notify: dropped $dropped held message(s)"
+    return 0
+}
+
+status() {
+    local files
+    files=("$SPOOL_DIR"/*.msg)
+    if [ ! -e "${files[0]}" ]; then
+        echo "nothing held"
+    else
+        read_held "${files[0]}"
+        echo "${#files[@]} message(s) held since $(date -d "@$sp_created" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+    fi
+    if [ -n "$PHONE_IP" ]; then
+        phone_present && echo "phone $PHONE_IP: home" || echo "phone $PHONE_IP: away"
+    else
+        echo "no phone configured, nothing is ever held"
+    fi
+    echo "spool: $SPOOL_DIR$(holding_possible && echo "" || echo "  (not usable, messages are sent immediately)")"
+}
+
+# --------------------------------------------------------------------------- main
+
+case "${1:-}" in
+    --flush)  load_config; flush; exit 0 ;;
+    --status) load_config; status; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+esac
+
+priority="default"
+tags=""
+topic=""
+click=""
+while getopts ":p:t:T:c:h" opt; do
+    case "$opt" in
+        p) priority="$OPTARG" ;;
+        t) tags="$OPTARG" ;;
+        T) topic="$OPTARG" ;;
+        c) click="$OPTARG" ;;
+        h) usage; exit 0 ;;
+        :) echo "ntfy-notify: option -$OPTARG needs a value" >&2; exit 1 ;;
+        *) echo "ntfy-notify: unknown option -$OPTARG" >&2; usage >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [ $# -lt 1 ]; then
+    echo "ntfy-notify: a title is required" >&2
+    usage >&2
+    exit 1
+fi
+title="$1"; shift
+
+if [ $# -eq 0 ] || { [ $# -eq 1 ] && [ "$1" = "-" ]; }; then
+    if [ -t 0 ]; then message=""; else message=$(cat); fi
+else
+    message="$*"
+fi
+
+case "$priority" in
+    min|low|default|high|urgent|[1-5]) ;;
+    *) echo "ntfy-notify: bad priority '$priority'" >&2; exit 1 ;;
+esac
+
+load_config
+[ -n "$topic" ] || topic="$CONF_TOPIC"
+
+host=$(hostname -s 2>/dev/null || hostname)
+all_tags="${host}${tags:+,$tags}"
+
+if [ "${NTFY_NOTIFY_DRY_RUN:-0}" = 1 ]; then
+    printf 'ntfy-notify DRY: POST %s/%s priority=%s tags=%s title=%s%s\n%s\n' \
+        "$URL" "$topic" "$priority" "$all_tags" "$title" "${click:+ click=$click}" "$message"
+    exit 0
+fi
+
+# The phone is away and we can hold: queue it instead of wasting the one
+# delivery attempt Apple gives us on a notification the phone cannot read.
+if holding_possible && ! phone_present; then
+    hold "$priority" "$all_tags" "$title" "$click" "$topic" "$message" && exit 0
+    echo "ntfy-notify: could not write to $SPOOL_DIR, sending now instead" >&2
+fi
+
+send_now "$priority" "$all_tags" "$title" "$click" "$topic" "$message"
+rc=$?
+[ "$rc" = 0 ] && exit 0
+
+# Could not be delivered now (server down or restarting). Hold it so the flush
+# timer retries; a 4xx is the server's final word and is not held.
+if [ "$rc" = 2 ] && holding_possible; then
+    hold "$priority" "$all_tags" "$title" "$click" "$topic" "$message" && {
+        echo "ntfy-notify: held it for the next flush" >&2
+        exit 0
+    }
+fi
+exit 2

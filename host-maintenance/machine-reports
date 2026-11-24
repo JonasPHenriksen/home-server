@@ -1,0 +1,374 @@
+#!/bin/bash
+#
+# machine-reports - read what the backup server and the desktop report about
+# their runs, and push what matters.
+#
+# Neither machine sends pushes of its own. Each writes a report of its run to
+# this laptop, in the logs directory, the same way the backup heartbeat travels:
+#
+#   backup-server/report-<run>.txt   the backup server, at the end of its run
+#   desktop/report-<run>.txt         the desktop, at the end of its weekly job
+#
+# Every five minutes (machine-reports.timer) this:
+#
+#   * sends the one weekly push. The backup server only runs after the laptop's
+#     Sunday reboot, so the weekly job no longer pushes its "OK" itself: it
+#     leaves the laptop's part in $LOG_DIR/.weekly-summary, and the push goes
+#     out here once the backup server's report is in - laptop, backup server
+#     and desktop in one message - or at the deadline without it;
+#   * pushes a report that arrives at any other time (a manual run, the desktop
+#     catching up after a missed Saturday) only when it shows a problem;
+#   * keeps the newest 52 reports of each machine.
+#
+# A problem is anything worth looking at: a failed run and the lines that say
+# why, an unhealthy disk or a failed self-test, little free space, a copy that
+# was not refreshed, failed units, and installed scripts that differ from this
+# repository - the laptop has the repository, so it can tell when a machine
+# still runs an old version.
+#
+#   machine-reports            one round (the timer)
+#   machine-reports --status   the newest report of each machine and its problems; never pushes
+#
+# Environment (tests): LOG_DIR, STATE_DIR, NOTIFY, REPO, NOW.
+
+set -u
+export LC_ALL=C.UTF-8
+
+LOG_DIR="${LOG_DIR:-/mnt/dietpi_userdata/logs}"
+STATE_DIR="${STATE_DIR:-/var/lib/machine-reports}"
+NOTIFY="${NOTIFY:-/usr/local/bin/ntfy-notify}"
+REPO="${REPO:-/home/dietpi/host-maintenance}"
+LOG="$LOG_DIR/machine-reports.log"
+PENDING="$LOG_DIR/.weekly-summary"
+HEARTBEAT="$LOG_DIR/backup-server/heartbeat"
+
+KEEP_REPORTS=52
+DEADLINE_SECS=8100        # 2 h 15 min after the weekly job, about 04:10: the backup server is done by 02:30
+MIN_FREE_GB=100           # on the backup disk
+COPY_MAX_AGE_DAYS=8       # the laptop copy the backup server pulls is refreshed every Sunday
+# The desktop is switched on when it is needed, not left running. The weekly push
+# always says when it last did its cycle, and warns only after a month without one.
+DESKTOP_MAX_AGE_DAYS=30
+DESKTOP_COPY="${DESKTOP_COPY:-/mnt/dietpi-desktop-backup}"   # its system tree here: mtime = its last backup
+
+# Installed file (as named in a report) -> the repository file it should match.
+declare -A BS_FILES=(
+    [ssh-backups-cycle.sh]=backup-server/pull-backups.sh
+    [verify-backups.sh]=backup-server/verify-backups.sh
+    [ssh-backups.service]=backup-server/ssh-backups.service
+    [ssh-backups.timer]=backup-server/ssh-backups.timer
+    [wol.service]=backup-server/wol.service
+)
+declare -A DESKTOP_FILES=(
+    [dietpi-backup-sync.sh]=desktop/dietpi-backup-sync.sh
+    [dietpi-boot-backup.timer]=desktop/dietpi-boot-backup.timer
+    [dietpi-boot-backup.service]=desktop/dietpi-boot-backup.service
+)
+
+now=${NOW:-$(date +%s)}
+
+# --------------------------------------------------------------------------- helpers
+
+log()  { echo "$(date -u '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG" 2>/dev/null; }
+when() { date -u -d "$1" '+%a %d %b %H:%M UTC' 2>/dev/null; }
+epoch() { date -u -d "$1" +%s 2>/dev/null; }
+# A whole number from a report, or 0. The reports are written by other machines,
+# and bash evaluates the text inside $(( )) as an expression: a value such as
+# a[$(cmd)] would run cmd here, as root. So no report value goes into $(( ))
+# without passing through this (or epoch, whose output is date's).
+num() { [[ ${1:-} =~ ^[0-9]+$ ]] && echo "$1" || echo 0; }
+
+# send PRIORITY TAGS TITLE BODY; succeeds when ntfy-notify sent or held it
+send() {
+    if [ ! -x "$NOTIFY" ]; then
+        log "WARNING: $NOTIFY not executable, cannot notify: $3"
+        return 1
+    fi
+    if "$NOTIFY" -p "$1" -t "$2" "$3" "$4" >/dev/null 2>&1; then
+        log "notified: $3"
+    else
+        log "WARNING: ntfy-notify failed for: $3 (retried next round)"
+        return 1
+    fi
+}
+
+# The key=value lines at the top of a report (or the pending summary) into KV.
+declare -A KV=()
+load() {
+    local k v
+    KV=()
+    [ -r "$1" ] || return 1
+    while IFS='=' read -r k v; do
+        [[ $k == '#'* || -z $k ]] && continue
+        [[ $k == '====='* ]] && break
+        KV[$k]=$v
+    done < "$1"
+}
+
+# One "===== NAME" section of a report.
+section() { awk -v s="===== $2" '$0 == s {on = 1; next} /^===== / {on = 0} on' "$1"; }
+
+# Newest report of a machine, or nothing.
+newest() { ls -1 "$LOG_DIR/$1"/report-*.txt 2>/dev/null | tail -n 1; }
+
+gb() { awk -v b="${1:-0}" 'BEGIN {printf (b >= 1e9 ? "%.1f GB" : "%.0f MB"), b / (b >= 1e9 ? 1e9 : 1e6)}'; }
+
+# Installed files whose checksum in the report differs from the repository's.
+drift() {  # drift ASSOC-NAME
+    local -n files=$1
+    local f want have out=()
+    for f in "${!files[@]}"; do
+        have=${KV[sha256_$f]:-}
+        [ -n "$have" ] && [ -r "$REPO/${files[$f]}" ] || continue
+        want=$(sha256sum "$REPO/${files[$f]}" | cut -d' ' -f1)
+        [ "$have" = "$want" ] || out+=("$f")
+    done
+    [ "${#out[@]}" -gt 0 ] && printf '%s\n' "${out[@]}" | sort | paste -sd' '
+}
+
+age_days() { local e; e=$(epoch "$1") || return 1; [ -n "$e" ] && echo $(( (now - e) / 86400 )); }
+
+# --------------------------------------------------------------------------- the backup server
+
+# One line per problem in a backup-server report (KV loaded).
+bs_problems() {
+    local report="$1" t age d
+    # what the run itself logged as a warning or failure, without the timestamps
+    section "$report" problems | grep -v '^none$' | sed -E 's/^[0-9-]+ [0-9:]+ - //'
+    case "${KV[disk_health]:-}" in
+        PASSED) ;;
+        unavailable|'') echo "disk health could not be read" ;;
+        *) echo "disk health: ${KV[disk_health]}" ;;
+    esac
+    [ "${KV[disk_reallocated]:-0}" -gt 0 ] 2>/dev/null && echo "disk: ${KV[disk_reallocated]} reallocated sector(s)"
+    [ "${KV[disk_pending]:-0}" -gt 0 ] 2>/dev/null && echo "disk: ${KV[disk_pending]} pending sector(s)"
+    [ "${KV[disk_uncorrectable]:-0}" -gt 0 ] 2>/dev/null && echo "disk: ${KV[disk_uncorrectable]} uncorrectable sector(s)"
+    case "${KV[selftest]:-}" in
+        ''|*'without error'*|*progress*) ;;
+        *) echo "disk self-test: ${KV[selftest]}" ;;
+    esac
+    [ "${KV[free_gb]:-999}" -lt "$MIN_FREE_GB" ] 2>/dev/null && echo "only ${KV[free_gb]} GB free on the backup disk"
+    # The laptop's copy is refreshed every Sunday. How old the desktop's may be is
+    # judged from the desktop itself, with a month's leeway (desktop_part).
+    if [ -n "${KV[tree_laptop_source_time]:-}" ] && age=$(age_days "${KV[tree_laptop_source_time]}"); then
+        [ "$age" -gt "$COPY_MAX_AGE_DAYS" ] && echo "the laptop copy it pulled is $age days old: not refreshed"
+    fi
+    [ "${KV[failed_units]:-0}" -gt 0 ] 2>/dev/null && echo "${KV[failed_units]} failed unit(s) on the backup server"
+    # It is meant to be off outside its run. Staying on means next Sunday's
+    # wake-up does nothing, since its run only starts at boot.
+    [ "${KV[decision]:-}" = stay-awake-user ] && \
+        echo "stayed on after its run because someone was logged in (the Claude app counts): switch it off, or next Sunday's wake-up won't start a run"
+    # A run on a machine that had been up long before it (the wake-up normally
+    # boots it five minutes earlier). Only with a synced clock: the start time
+    # of an unsynced run is last week's.
+    if [ "${KV[clock_synced]:-}" = yes ] && [ -n "${KV[started]:-}" ] && [ -n "${KV[booted]:-}" ]; then
+        local up_s
+        up_s=$(( $(epoch "${KV[started]}") - $(epoch "${KV[booted]}") ))
+        [ "$up_s" -gt 1800 ] && \
+            echo "had been on for $(( up_s / 3600 )) h $(( up_s % 3600 / 60 )) min before this run: it's meant to be off outside its Sunday run"
+    fi
+    d=$(drift BS_FILES)
+    [ -n "$d" ] && echo "runs a different $d than the repository: install from the README, \"The backup server\""
+}
+
+bs_line() {
+    local t ok=0 n=0 bytes=0 bits=()
+    for t in laptop desktop nextcloud; do
+        n=$((n + 1))
+        case "${KV[tree_$t]:-}" in ok|incomplete) ok=$((ok + 1)) ;; esac
+        bytes=$(( bytes + $(num "${KV[tree_${t}_bytes_transferred]:-}") ))
+    done
+    if [ "$ok" -eq "$n" ]; then bits+=("$n backups OK"); else bits+=("$ok of $n backups OK"); fi
+    bits+=("$(gb "$bytes") new")
+    case "${KV[verify_source]:-}/${KV[verify_scrub]:-}" in
+        ok/ok|ok/not-run) bits+=("verify OK") ;;
+        not-installed/*|skipped/*) ;;
+        *) bits+=("verify FAILED") ;;
+    esac
+    [ "${KV[disk_health]:-}" = PASSED ] && bits+=("disk OK")
+    bits+=("${KV[free_gb]:-?} GB free")
+    local joined
+    joined=$(printf '%s, ' "${bits[@]}")
+    echo "Backup server: ${joined%, }."
+}
+
+# --------------------------------------------------------------------------- the desktop
+
+desktop_problems() {
+    local report="$1" d
+    section "$report" problems | grep -v '^none$' | sed -E 's/^\[[0-9-]+ [0-9:]+\] //'
+    d=$(drift DESKTOP_FILES)
+    [ -n "$d" ] && echo "runs a different $d than the repository: install from the README, \"The desktop\""
+}
+
+# "3 h ago", "1 day ago", "12 days ago"
+ago() {
+    local s=$(( now - $1 ))
+    if [ "$s" -lt 86400 ]; then echo "$(( s / 3600 )) h ago"
+    elif [ "$s" -lt 172800 ]; then echo "1 day ago"
+    else echo "$(( s / 86400 )) days ago"; fi
+}
+
+at_epoch() { date -u -d "@$1" '+%a %d %b %H:%M UTC'; }
+
+# The desktop's line in the weekly push and its problems, in DESK_LINE and
+# DESK_PROBLEMS. The newest report says how its last cycle went; the copy of its
+# system tree on this laptop says when it last backed up at all (dietpi-backup
+# touches the tree's top directory at the end and rsync keeps that time), which
+# also covers a desktop that still runs an older script and sends no report.
+DESK_LINE=""
+DESK_PROBLEMS=()
+desktop_part() {
+    local report rep_t="" copy_t last p
+    DESK_PROBLEMS=()
+    report=$(newest desktop)
+    copy_t=$(stat -c %Y "$DESKTOP_COPY" 2>/dev/null)
+    if [ -n "$report" ] && load "$report"; then rep_t=$(epoch "${KV[finished]:-}"); fi
+    if [ -n "$rep_t" ] && { [ -z "$copy_t" ] || [ "$rep_t" -ge $(( copy_t - 3600 )) ]; }; then
+        last=$rep_t
+        if [ "${KV[status]:-}" = ok ]; then
+            DESK_LINE="Desktop: last on $(at_epoch "$last") ($(ago "$last")): backed up and updated, checks OK."
+        else
+            DESK_LINE="Desktop: last on $(at_epoch "$last") ($(ago "$last")): its run had ${KV[failures]:-?} problem(s)."
+        fi
+        while IFS= read -r p; do [ -n "$p" ] && DESK_PROBLEMS+=("desktop: $p"); done < <(desktop_problems "$report")
+    elif [ -n "$copy_t" ]; then
+        last=$copy_t
+        DESK_LINE="Desktop: last backup $(at_epoch "$last") ($(ago "$last"))."
+    else
+        DESK_LINE="Desktop: no backup of it here yet."
+        DESK_PROBLEMS+=("desktop: no backup of it has ever arrived on the laptop")
+        return 0
+    fi
+    if [ $(( (now - last) / 86400 )) -gt "$DESKTOP_MAX_AGE_DAYS" ]; then
+        DESK_PROBLEMS+=("desktop: not switched on for its cycle in $(( (now - last) / 86400 )) days; switch it on so it backs up and updates")
+    fi
+}
+
+# --------------------------------------------------------------------------- the weekly push
+
+laptop_line() {  # from the pending summary (KV loaded)
+    local disk=${KV[disk]:-} health
+    health=$(sed -n 's/.*health=\([^ ]*\).*/\1/p' <<< "$disk")
+    if [ "${KV[failures]:-0}" = 0 ]; then
+        echo "Laptop: backup, updates and Pi-hole done${KV[containers]:+, containers updated: ${KV[containers]}}, disk ${health:-not checked}."
+    else
+        echo "Laptop: ${KV[failures]} failed step(s), pushed at $(date -u -d "@${KV[created]:-$now}" '+%H:%M'): ${KV[warnings]:-see weekly-updater.log}"
+    fi
+}
+
+# weekly_push [BACKUP-SERVER-REPORT]: laptop, backup server and desktop in one push
+weekly_push() {
+    local bs="${1:-}" lines=() problems=() p title
+    load "$PENDING"
+    lines+=("$(laptop_line)")
+    [ "${KV[failures]:-0}" != 0 ] && problems+=("laptop: ${KV[failures]} failed step(s)")
+    local pending_created=${KV[created]:-$now} was_on=${KV[backup_server_was_on]:-}
+
+    if [ -n "$bs" ] && load "$bs"; then
+        lines+=("$(bs_line)")
+        while IFS= read -r p; do [ -n "$p" ] && problems+=("backup server: $p"); done < <(bs_problems "$bs")
+    elif [ "$was_on" = yes ]; then
+        lines+=("Backup server: was already on, so no run this week.")
+        problems+=("backup server was already on when the laptop went to wake it, so its weekly run didn't start. It's meant to be off: switch it off, or reboot it now to run this week's backup")
+    else
+        p="no report from the backup server (it runs after the laptop's reboot and was due by now)"
+        if load "$HEARTBEAT" && [ "$(stat -c %Y "$HEARTBEAT")" -ge "$pending_created" ]; then
+            p+="; its early status said ${KV[status]:-?} with ${KV[failures]:-?} failure(s), ${KV[free_gb]:-?} GB free"
+        fi
+        lines+=("Backup server: no report.")
+        problems+=("$p")
+    fi
+
+    desktop_part
+    lines+=("$DESK_LINE")
+    problems+=("${DESK_PROBLEMS[@]}")
+
+    local body
+    body=$(printf '%s\n' "${lines[@]}")
+    if [ "${#problems[@]}" -eq 0 ]; then
+        send low white_check_mark "Weekly maintenance OK" "$body" || return 1
+    else
+        title="Weekly maintenance: ${#problems[@]} problem(s)"
+        body+=$'\n'"Problems:"$'\n'$(printf -- '- %s\n' "${problems[@]}")
+        send high warning "$title" "$body" || return 1
+    fi
+    rm -f "$PENDING"
+}
+
+# --------------------------------------------------------------------------- rounds
+
+# Reports of MACHINE newer than the last one handled, oldest first.
+unseen() {
+    local last
+    last=$(cat "$STATE_DIR/$1.last" 2>/dev/null)
+    ls -1 "$LOG_DIR/$1"/report-*.txt 2>/dev/null | while IFS= read -r f; do
+        [[ -z $last || $(basename "$f") > $last ]] && echo "$f"
+    done
+}
+
+prune() {
+    ls -1 "$LOG_DIR/$1"/report-*.txt 2>/dev/null | head -n -"$KEEP_REPORTS" | xargs -r rm -f
+}
+
+round() {
+    local m report problems title weekly_done=0
+    mkdir -p "$STATE_DIR"
+    for m in backup-server desktop; do
+        prune "$m"
+        while IFS= read -r report; do
+            [ -n "$report" ] || continue
+            load "$report"
+            if [ "$m" = backup-server ]; then problems=$(bs_problems "$report"); else problems=$(desktop_problems "$report"); fi
+            log "$m: $(basename "$report") status=${KV[status]:-?}, $(grep -c . <<< "$problems") problem(s)"
+            # The Sunday run's report completes the weekly push. Any other
+            # report is only worth a push when something is wrong.
+            if [ "$m" = backup-server ] && [ -e "$PENDING" ] \
+               && [ "$(stat -c %Y "$report")" -ge "$(stat -c %Y "$PENDING")" ]; then
+                weekly_push "$report" || return 0
+                weekly_done=1
+            elif [ -n "$problems" ]; then
+                if [ "$m" = backup-server ]; then title="Backup server"; else title="Desktop"; fi
+                send high warning "$title: $(grep -c . <<< "$problems") problem(s)" \
+                    "Run ${KV[run]:-?}: $(printf '%s\n' "$problems" | head -n 8)" || return 0
+            fi
+            basename "$report" > "$STATE_DIR/$m.last"
+        done < <(unseen "$m")
+    done
+    # No report is coming when the backup server was already on (it only runs
+    # at boot): push at once rather than at the deadline.
+    if [ "$weekly_done" = 0 ] && [ -e "$PENDING" ]; then
+        if grep -q '^backup_server_was_on=yes' "$PENDING"; then
+            log "weekly push now: the backup server was already on, no report is coming"
+            weekly_push ""
+        elif [ $(( now - $(stat -c %Y "$PENDING") )) -ge "$DEADLINE_SECS" ]; then
+            log "weekly push at the deadline, without a backup-server report"
+            weekly_push ""
+        fi
+    fi
+    return 0
+}
+
+status() {
+    local report p
+    report=$(newest backup-server)
+    if [ -z "$report" ]; then
+        echo "backup server: no report yet"
+    else
+        load "$report"
+        echo "$(bs_line) Run $(when "${KV[finished]:-}")."
+        p=$(bs_problems "$report")
+        [ -n "$p" ] && sed 's/^/  problem: /' <<< "$p"
+    fi
+    desktop_part
+    echo "$DESK_LINE"
+    for p in "${DESK_PROBLEMS[@]}"; do echo "  problem: ${p#desktop: }"; done
+    [ -e "$PENDING" ] && echo "weekly push waiting for the backup server since $(date -u -d "@$(stat -c %Y "$PENDING")" '+%H:%M UTC')"
+    return 0
+}
+
+case "${1:-}" in
+    --status) status ;;
+    *) round ;;
+esac
+exit 0

@@ -1,0 +1,14 @@
+[Unit]
+Description=Check every minute whether held ntfy notifications can be sent
+
+[Timer]
+# Two minutes after boot, so the weekly job's reboot does not strand anything,
+# then once a minute. A run with an empty spool touches nothing and does not
+# probe the network, so this is close to free.
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Warn if the backup server has stopped checking in
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/check-backup-heartbeat
+# A detected problem is reported by notification, not by a failed unit.
+SuccessExitStatus=0 1

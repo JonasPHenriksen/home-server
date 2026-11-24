@@ -1,0 +1,52 @@
+{
+  "phones": {
+    "phone_1": {
+      "ip": "192.168.50.13"
+    },
+    "phone_2": {
+      "ip": "192.168.50.15"
+    }
+  },
+  "presence": {
+    "methods": [
+      "icmp",
+      "tcp",
+      "arp"
+    ],
+    "tcp_ports": [
+      62078
+    ],
+    "timeout_seconds": 1.5
+  },
+  "cameras": {
+    "cam_1": {
+      "ip": "192.168.50.16",
+      "group": "always",
+      "rtsp": "rtsp://USER:PASSWORD@192.168.50.16:554/stream2"
+    },
+    "cam_2": {
+      "ip": "192.168.50.14",
+      "group": "night",
+      "rtsp": "rtsp://USER:PASSWORD@192.168.50.14:554/stream2"
+    }
+  },
+  "recording": {
+    "root": "recordings",
+    "control_file": ".tapo_motion_state",
+    "record_when": "enable",
+    "retain_days": 14,
+    "min_free_gb": 20,
+    "segment_seconds": 600,
+    "stall_seconds": 60,
+    "audio": "aac",
+    "fragmented_mp4": true,
+    "notify_command": "/usr/local/bin/ntfy-notify",
+    "notify_after_failures": 5
+  },
+  "status_page": {
+    "port": 8090,
+    "bind": "0.0.0.0",
+    "auth": "USER:PASSWORD",
+    "thumbnails": true
+  }
+}

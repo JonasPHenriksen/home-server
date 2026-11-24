@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cameras</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e8ee; --dim:#8b93a7; --acc:#a6e22e; --warn:#f2c14e; --bad:#ff6b6b; --ok:#57d68d; --blue:#5aa9ff; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:10px 18px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:2 }
+  header h1 { font-size:16px; margin:0 8px 0 0; font-weight:600 }
+  .badge { padding:3px 9px; border-radius:999px; font-weight:600; font-size:12px; letter-spacing:.02em }
+  .home { background:#1f3b2a; color:var(--ok) } .away { background:#4a3a12; color:var(--warn) } .unknown { background:#333; color:var(--dim) }
+  .muted { color:var(--dim) }
+  main { padding:14px 16px; max-width:1400px; margin:0 auto }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:10px; margin-bottom:16px }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px }
+  .card b { display:block; margin-bottom:3px }
+  .state-recording { color:var(--ok) } .state-backoff { color:var(--bad) } .state-idle,.state-stopping { color:var(--dim) }
+  .days { display:flex; gap:6px; flex-wrap:wrap; margin:6px 0 12px }
+  .days button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; font-size:13px }
+  .days button.sel { border-color:var(--acc); color:var(--acc) }
+  .days button small { color:var(--dim); margin-left:6px }
+  .timeline { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px 6px; overflow-x:auto }
+  .ruler { position:relative; height:16px; margin-left:110px; color:var(--dim); font-size:11px }
+  .ruler span { position:absolute; transform:translateX(-50%) }
+  .row { display:flex; align-items:center; height:34px }
+  .row .name { width:110px; flex:none; font-weight:600; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .track { position:relative; flex:1; height:22px; background:#0b0d11; border-radius:4px; min-width:600px }
+  .track .tick { position:absolute; top:0; bottom:0; width:1px; background:var(--line) }
+  .seg { position:absolute; top:3px; bottom:3px; background:var(--blue); border-radius:2px; min-width:3px; cursor:pointer; opacity:.85 }
+  .seg:hover { opacity:1; outline:1px solid #fff }
+  .seg.sel { background:var(--acc) } .seg.live { background:var(--ok); box-shadow:0 0 6px var(--ok) }
+  .player { display:grid; grid-template-columns: minmax(0,2fr) minmax(260px,1fr); gap:14px; margin-top:14px }
+  @media (max-width:900px){ .player { grid-template-columns:1fr } }
+  video { width:100%; background:#000; border-radius:8px; max-height:60vh }
+  .side { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px }
+  .side h2 { margin:0 0 6px; font-size:15px }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 }
+  .btn { display:inline-block; background:#232838; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:7px 12px; text-decoration:none; cursor:pointer; font:inherit; font-size:13px }
+  .btn.primary { background:var(--acc); color:#111; border-color:var(--acc); font-weight:600 }
+  .btn:disabled { opacity:.4; cursor:default }
+  .strip { display:flex; gap:6px; overflow-x:auto; padding:8px 0 4px; scroll-snap-type:x proximity }
+  .strip .th { flex:none; width:160px; cursor:pointer; scroll-snap-align:center; border:2px solid transparent; border-radius:6px; overflow:hidden; background:#0b0d11 }
+  .strip .th.sel { border-color:var(--acc) }
+  .strip img { display:block; width:160px; height:90px; object-fit:cover; background:#0b0d11 }
+  .strip .cap { font-size:11px; color:var(--dim); padding:2px 5px 4px; display:flex; justify-content:space-between }
+  .empty { color:var(--dim); padding:20px; text-align:center }
+  details { margin-top:16px } summary { cursor:pointer; color:var(--dim) }
+  pre { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; font-size:12px; overflow:auto; max-height:320px; margin:8px 0 }
+  .warnline { color:var(--warn) } .badline { color:var(--bad) }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cameras</h1>
+  <span id="presence" class="badge unknown">…</span>
+  <span id="phones" class="muted"></span>
+  <span id="night" class="muted"></span>
+  <span id="disk" class="muted"></span>
+  <span id="clock" class="muted" style="margin-left:auto"></span>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+
+  <div id="days" class="days"></div>
+  <div class="timeline" id="timeline"><div class="empty">Loading…</div></div>
+
+  <div class="player" id="player" hidden>
+    <div>
+      <video id="video" controls playsinline preload="metadata"></video>
+      <div class="strip" id="strip"></div>
+    </div>
+    <div class="side">
+      <h2 id="clipTitle">—</h2>
+      <div class="muted" id="clipMeta"></div>
+      <div class="btns">
+        <a class="btn primary" id="download" href="#" download>Download clip</a>
+        <button class="btn" id="prev">◀ Previous</button>
+        <button class="btn" id="next">Next ▶</button>
+      </div>
+      <div class="muted" style="font-size:12px">Recording runs only while nobody is home; days with people at home are empty on purpose. Clips are kept <span id="retain">?</span> days.</div>
+    </div>
+  </div>
+
+  <details>
+    <summary>Recent log lines</summary>
+    <pre id="logPresence"></pre>
+    <pre id="logRecorder"></pre>
+  </details>
+</main>
+
+<script>
+(() => {
+  const $ = s => document.querySelector(s);
+  const fmtBytes = n => n == null ? '' : n < 1e9 ? (n/1e6).toFixed(0)+' MB' : (n/1e9).toFixed(1)+' GB';
+  const pad = n => String(n).padStart(2,'0');
+  const hhmm = s => pad(Math.floor(s/3600))+':'+pad(Math.floor(s%3600/60));
+  let status = null, day = null, dayData = null, cam = null, clips = [], idx = -1;
+
+  async function getJSON(u){ const r = await fetch(u, {cache:'no-store'}); if(!r.ok) throw new Error(u+' '+r.status); return r.json(); }
+
+  function renderStatus(){
+    const p = status.presence, badge = $('#presence');
+    badge.className = 'badge ' + (p.state==='enable' ? 'away' : p.state==='disable' ? 'home' : 'unknown');
+    badge.textContent = p.state==='enable' ? 'AWAY · cameras armed' : p.state==='disable' ? 'HOME · privacy mode' : 'state unknown';
+    $('#phones').textContent = p.probe_error ? '⚠ presence probe failing' :
+      p.phones_missing_checks ? `no phone for ${p.phones_missing_checks} checks (arms at ${p.away_threshold})` : 'a phone is home' ;
+    if (p.switch_pending) $('#phones').textContent += ' · switch incomplete, retrying';
+    $('#night').textContent = status.night;
+    $('#disk').textContent = `${fmtBytes(status.disk.recordings_bytes)} recorded · ${fmtBytes(status.disk.free_bytes)} free`;
+    $('#clock').textContent = status.time;
+    $('#retain').textContent = status.retain_days;
+    const cards = $('#cards'); cards.innerHTML = '';
+    for (const [name, c] of Object.entries(status.recorder.cameras || {})) {
+      const el = document.createElement('div'); el.className = 'card';
+      let line = `<span class="state-${c.state}">${c.state}</span>`;
+      if (c.state === 'recording' && c.running_for_seconds != null) line += ` <span class="muted">${Math.round(c.running_for_seconds/60)} min</span>`;
+      if (c.failures) line += ` <span class="badline">${c.failures} failure${c.failures>1?'s':''}</span>`;
+      if (c.retry_in_seconds != null) line += ` <span class="muted">retry in ${c.retry_in_seconds}s</span>`;
+      el.innerHTML = `<b>${name}</b>${line}` + (c.last_error ? `<div class="muted" style="font-size:12px;margin-top:4px">${escapeHtml(c.last_error).slice(0,140)}</div>` : '');
+      cards.appendChild(el);
+    }
+  }
+  function escapeHtml(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+  async function loadDays(){
+    const days = await getJSON('/api/days');
+    const box = $('#days'); box.innerHTML = '';
+    if (!days.length) { $('#timeline').innerHTML = '<div class="empty">No recordings yet. The cameras record only while the house is empty.</div>'; return; }
+    for (const d of days) {
+      const b = document.createElement('button');
+      b.innerHTML = `${d.date}<small>${d.segments} clips · ${fmtBytes(d.bytes)}</small>`;
+      b.onclick = () => selectDay(d.date);
+      b.dataset.date = d.date; box.appendChild(b);
+    }
+    if (!day || !days.some(d => d.date === day)) day = days[0].date;
+    await selectDay(day);
+  }
+
+  async function selectDay(d){
+    day = d;
+    document.querySelectorAll('#days button').forEach(b => b.classList.toggle('sel', b.dataset.date === d));
+    dayData = await getJSON('/api/day/' + d);
+    renderTimeline();
+    if (cam && dayData.cameras[cam] && dayData.cameras[cam].length) { clips = dayData.cameras[cam]; if (idx < 0 || idx >= clips.length) idx = clips.length - 1; renderStrip(); }
+  }
+
+  function renderTimeline(){
+    const tl = $('#timeline'); tl.innerHTML = '';
+    const ruler = document.createElement('div'); ruler.className = 'ruler';
+    for (let h = 0; h <= 24; h += 2) { const s = document.createElement('span'); s.style.left = (h/24*100)+'%'; s.textContent = pad(h)+':00'; ruler.appendChild(s); }
+    tl.appendChild(ruler);
+    let any = false;
+    for (const [name, list] of Object.entries(dayData.cameras)) {
+      const row = document.createElement('div'); row.className = 'row';
+      const label = document.createElement('div'); label.className = 'name'; label.textContent = name; row.appendChild(label);
+      const track = document.createElement('div'); track.className = 'track';
+      for (let h = 1; h < 24; h++) { const t = document.createElement('div'); t.className = 'tick'; t.style.left = (h/24*100)+'%'; track.appendChild(t); }
+      list.forEach((c, i) => {
+        any = true;
+        const seg = document.createElement('div'); seg.className = 'seg' + (c.live ? ' live' : '') + (cam===name && clips[idx] && clips[idx].name===c.name ? ' sel' : '');
+        seg.style.left = (c.start_s/86400*100)+'%'; seg.style.width = Math.max(0.15, c.duration/86400*100)+'%';
+        seg.title = `${name} ${c.start} · ${Math.round(c.duration/60)} min · ${fmtBytes(c.bytes)}${c.live?' · recording now':''}`;
+        seg.onclick = () => { cam = name; clips = list; idx = i; play(); };
+        track.appendChild(seg);
+      });
+      row.appendChild(track); tl.appendChild(row);
+    }
+    if (!any) tl.insertAdjacentHTML('beforeend', '<div class="empty">Nothing recorded on this day: somebody was home.</div>');
+  }
+
+  function play(){
+    const c = clips[idx]; if (!c) return;
+    $('#player').hidden = false;
+    const url = `/clip/${encodeURIComponent(cam)}/${encodeURIComponent(c.name)}`;
+    const v = $('#video'); if (v.src !== location.origin + url) { v.src = url; v.load(); }
+    v.play().catch(()=>{});
+    $('#clipTitle').textContent = `${cam} · ${day} ${c.start}`;
+    $('#clipMeta').textContent = `${Math.round(c.duration/60)} min · ${fmtBytes(c.bytes)} · ${c.name}${c.live ? ' · still being written' : ''}`;
+    const dl = $('#download'); dl.href = url + '?download=1'; dl.setAttribute('download', `${cam}_${c.name}`);
+    $('#prev').disabled = idx <= 0; $('#next').disabled = idx >= clips.length - 1;
+    renderTimeline(); renderStrip();
+    document.querySelector('.strip .th.sel')?.scrollIntoView({inline:'center', block:'nearest', behavior:'smooth'});
+  }
+
+  function renderStrip(){
+    const s = $('#strip'); s.innerHTML = '';
+    clips.forEach((c, i) => {
+      const th = document.createElement('div'); th.className = 'th' + (i===idx?' sel':'');
+      const img = document.createElement('img'); img.loading = 'lazy'; img.alt = c.start;
+      img.src = `/thumb/${encodeURIComponent(cam)}/${encodeURIComponent(c.name.replace(/\.mp4$/, '.jpg'))}`;
+      img.onerror = () => { img.removeAttribute('src'); img.style.opacity = .3; };
+      th.appendChild(img);
+      th.insertAdjacentHTML('beforeend', `<div class="cap"><span>${c.start}</span><span>${Math.round(c.duration/60)}m</span></div>`);
+      th.onclick = () => { idx = i; play(); };
+      s.appendChild(th);
+    });
+  }
+
+  $('#prev').onclick = () => { if (idx > 0) { idx--; play(); } };
+  $('#next').onclick = () => { if (idx < clips.length-1) { idx++; play(); } };
+  $('#video').addEventListener('ended', () => { if (idx < clips.length-1) { idx++; play(); } });
+  document.addEventListener('keydown', e => { if (e.key==='ArrowLeft') $('#prev').click(); if (e.key==='ArrowRight') $('#next').click(); });
+
+  async function loadLogs(){
+    try { const l = await getJSON('/api/log');
+      $('#logPresence').innerHTML = (l.presence||[]).map(x => `<span class="${/ERROR|failed/.test(x)?'badline':/WARNING|incomplete/.test(x)?'warnline':''}">${escapeHtml(x)}</span>`).join('\n');
+      $('#logRecorder').innerHTML = (l.recorder||[]).map(x => `<span class="${/ERROR/.test(x)?'badline':/WARNING/.test(x)?'warnline':''}">${escapeHtml(x)}</span>`).join('\n');
+    } catch(e){}
+  }
+
+  async function refresh(){
+    try { status = await getJSON('/api/status'); renderStatus(); } catch(e){ $('#presence').textContent = 'status unavailable'; }
+  }
+  (async () => { await refresh(); await loadDays(); loadLogs(); })();
+  setInterval(refresh, 10000);
+  setInterval(async () => { if (day) { try { const fresh = await getJSON('/api/day/'+day); if (JSON.stringify(fresh) !== JSON.stringify(dayData)) { dayData = fresh; renderTimeline(); if (cam) { clips = dayData.cameras[cam]||[]; renderStrip(); } } } catch(e){} } }, 30000);
+  setInterval(loadLogs, 60000);
+})();
+</script>
+</body>
+</html>

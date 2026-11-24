@@ -1,0 +1,22 @@
+[Unit]
+Description=Lightweight RTSP recorder for the Tapo cameras (replaces Frigate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dietpi
+WorkingDirectory=/home/dietpi/tapo-automation
+ExecStart=/home/dietpi/tapo-automation/tapo-env/bin/python3 /home/dietpi/tapo-automation/cam_recorder.py
+Restart=always
+RestartSec=5
+# On stop, SIGTERM goes to the recorder AND its ffmpeg children (control-group),
+# so segments are finalised even if the recorder itself has died. Give them time.
+TimeoutStopSec=30
+KillMode=control-group
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

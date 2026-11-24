@@ -1,0 +1,17 @@
+[Unit]
+Description=Nothing runs from the backup snapshots (/home/dietpi/backups)
+Documentation=file:/home/dietpi/host-maintenance/README.md
+# The snapshot tree is bound onto itself, so every path stays the same. The
+# machines' setuid-root programs in the snapshots, old versions included, are
+# plain files then (nosuid, nodev, noexec). As a mount point, the tree can no
+# longer be renamed or replaced by dietpi, whose home it sits in; the directory
+# itself belongs to root and is closed to everyone else (README).
+
+[Mount]
+What=/home/dietpi/backups
+Where=/home/dietpi/backups
+Type=none
+Options=bind,nosuid,nodev,noexec
+
+[Install]
+WantedBy=local-fs.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Nothing runs from the desktop's Nextcloud mirror (/mnt/dietpi-desktop-nextcloud-backup)
+Documentation=file:/home/dietpi/host-maintenance/README.md
+# The tree is bound onto itself, so every path stays the same. Copies of the
+# machines' setuid-root programs are then plain files: dietpi cannot run them,
+# and nothing in a backup can run at all (nosuid, nodev, noexec).
+
+[Mount]
+What=/mnt/dietpi-desktop-nextcloud-backup
+Where=/mnt/dietpi-desktop-nextcloud-backup
+Type=none
+Options=bind,nosuid,nodev,noexec
+
+[Install]
+WantedBy=local-fs.target

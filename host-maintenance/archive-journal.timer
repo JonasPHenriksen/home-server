@@ -1,0 +1,14 @@
+[Unit]
+Description=Copy new journal entries to the data disk every 15 minutes
+
+[Timer]
+# Every quarter hour: the journal only lives in RAM until this runs, so the
+# interval is the amount of history a power cut can take. Each run reads only
+# what is new since the cursor, so the cost of a quiet run is nil.
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

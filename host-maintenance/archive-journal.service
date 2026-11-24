@@ -1,0 +1,7 @@
+[Unit]
+Description=Copy new journal entries to the data disk
+Documentation=file:/home/dietpi/host-maintenance/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/archive-journal

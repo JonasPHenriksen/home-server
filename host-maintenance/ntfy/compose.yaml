@@ -1,0 +1,37 @@
+# ntfy: push notifications for this host. See ../README.md, "Notifications".
+#
+#   docker compose -f /home/dietpi/host-maintenance/ntfy/compose.yaml up -d
+#
+# Data (user database, message cache) lives under /mnt/dietpi_userdata/ntfy so
+# dietpi-backup includes it. The container runs as dietpi (1000:1000).
+services:
+  ntfy:
+    image: binwiederhier/ntfy:v2   # the weekly job pulls this; v2 moves within compatible releases
+    container_name: ntfy
+    command: serve
+    restart: unless-stopped
+    user: "1000:1000"
+    # The host's network instead of published ports: Docker's published ports skip ufw, so
+    # this way ufw decides who reaches 8490, like every other port here (README, "Docker
+    # ports and ufw"). server.yml keeps the plain port 8082 on 127.0.0.1, for ntfy-notify.
+    network_mode: host
+    # Pushes reach the iPhone through ntfy.sh, which the server has to look up.
+    # Pi-hole first, as for everything else, then Quad9: otherwise "Pi-hole is
+    # not answering DNS queries" would be the one push that never arrives.
+    dns:
+      - 192.168.50.10
+      - 9.9.9.9
+    volumes:
+      - ./server.yml:/etc/ntfy/server.yml:ro
+      - /mnt/dietpi_userdata/ntfy/cache:/var/cache/ntfy
+      - /mnt/dietpi_userdata/ntfy/data:/var/lib/ntfy
+      # the laptop's certificate for the home sites (README, "HTTPS for the home sites")
+      - /home/dietpi/.config/home-tls:/certs:ro
+    environment:
+      - TZ=Etc/UTC
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 http://127.0.0.1:8082/v1/health -O - | grep -Eo '\"healthy\"\\s*:\\s*true' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

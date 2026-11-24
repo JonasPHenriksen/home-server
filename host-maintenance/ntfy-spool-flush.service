@@ -1,0 +1,18 @@
+[Unit]
+Description=Send ntfy notifications held while the phone was away
+Documentation=file:///home/dietpi/host-maintenance/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Not root: the spool is writable by group dietpi, so whatever reads it and acts
+# on its contents runs as dietpi too. It needs nothing root has: the config is
+# group dietpi, the folder's group write lets it delete, and ping, ip neigh and
+# curl work unprivileged.
+User=dietpi
+Group=dietpi
+ExecStart=/usr/local/bin/ntfy-notify --flush
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

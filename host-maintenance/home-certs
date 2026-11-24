@@ -1,0 +1,58 @@
+#!/bin/bash
+#
+# Makes the HTTPS certificates for the home sites: one for this laptop (the
+# wake page, MeTube, the camera page, Pi-hole's admin) and one for the
+# desktop, both signed by a private CA whose key is deleted the moment they
+# are made. Each device trusts ca.crt once, and with it every site. With its
+# key gone, the CA can never sign anything else. The price: renewing, every
+# 825 days (the most an iPhone accepts), means a new CA, trusted again on each
+# device. See README, "HTTPS for the home sites".
+#
+#   ~/host-maintenance/home-certs
+
+set -euo pipefail
+
+DIR="${HOME_TLS_DIR:-$HOME/.config/home-tls}"
+DAYS=825
+# Each machine by its addresses and names at home and on the tailnet.
+LAPTOP="IP:192.168.50.10,IP:100.64.0.10,DNS:dietpi-laptop,DNS:dietpi-laptop.tailnet-example.ts.net,DNS:pi.hole"
+DESKTOP="IP:192.168.50.20,IP:100.64.0.20,DNS:dietpi,DNS:dietpi.tailnet-example.ts.net"
+
+if [ -e "$DIR/ca.crt" ]; then
+    echo "There are certificates already, valid until $(openssl x509 -noout -enddate -in "$DIR/laptop.crt" | cut -d= -f2)."
+    echo "New ones have to be trusted again on every device and installed again on every site."
+    if [ ! -t 0 ] || ! read -rp "Make new ones? Type yes: " answer || [ "$answer" != yes ]; then
+        echo "Nothing changed." >&2
+        exit 1
+    fi
+fi
+
+umask 077
+mkdir -p "$DIR"
+tmp=$(mktemp -d)                # /tmp is in RAM here: the CA key never reaches the disk
+trap 'rm -rf "$tmp"' EXIT
+
+quiet() {                       # openssl chatters on stderr; show it only when it fails
+    local out
+    out=$("$@" 2>&1) || { echo "$out" >&2; return 1; }
+}
+
+ec=(-newkey ec -pkeyopt ec_paramgen_curve:P-256 -noenc)
+quiet openssl req -x509 "${ec[@]}" -days $((DAYS + 1)) -subj "/CN=DietPi home sites" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -keyout "$tmp/ca.key" -out "$tmp/ca.crt"
+
+issue() {                       # name, common name, subject alternative names
+    printf '%s\n' "basicConstraints=critical,CA:FALSE" "keyUsage=critical,digitalSignature" \
+        "extendedKeyUsage=serverAuth" "subjectAltName=$3" > "$tmp/$1.ext"
+    quiet openssl req -new "${ec[@]}" -subj "/CN=$2" -keyout "$tmp/$1.key" -out "$tmp/$1.csr"
+    quiet openssl x509 -req -in "$tmp/$1.csr" -CA "$tmp/ca.crt" -CAkey "$tmp/ca.key" \
+        -set_serial "0x$(openssl rand -hex 16)" -days "$DAYS" -sha256 -extfile "$tmp/$1.ext" -out "$tmp/$1.crt"
+}
+issue laptop dietpi-laptop "$LAPTOP"
+issue desktop dietpi "$DESKTOP"
+
+cp "$tmp"/{ca.crt,laptop.crt,laptop.key,desktop.crt,desktop.key} "$DIR"/
+chmod 600 "$DIR"/*
+echo "Made the certificates in $DIR, valid until $(openssl x509 -noout -enddate -in "$DIR/laptop.crt" | cut -d= -f2)."
+echo "The CA's key is already deleted. Trust ca.crt once on each device: README, \"HTTPS for the home sites\"."

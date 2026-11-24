@@ -1,0 +1,72 @@
+#!/bin/bash
+#
+# backup-logins/install - this laptop's side of the locked-down backup logins
+# (README, "Backup logins"). Run it as root, from the repo:
+#
+#   sudo ~/host-maintenance/backup-logins/install
+#
+# Safe to run again, e.g. once the backup server's new key has been added. It
+# only adds: dietpi's old `sudo rsync` and the machines' old keys keep working
+# until each machine has switched and passed a real run, and the report folders
+# stay writable by dietpi until then too. backup-logins/finish takes the old
+# way out afterwards.
+set -eu
+
+REPO="${REPO:-/home/dietpi/host-maintenance}"
+LOGS="${LOGS:-/mnt/dietpi_userdata/logs}"
+
+[ "$(id -u)" = 0 ] || { echo "backup-logins/install: run it with sudo" >&2; exit 1; }
+say() { echo "backup-logins: $*"; }
+
+# 1. Two accounts, one per machine. The password field is "*", not "!": that is
+#    "no password" to dropbear, while "!" means "locked" and would refuse the
+#    key as well. The shell is only there so dropbear can start the forced
+#    command; the key cannot get anything else. Home and .ssh belong to root, so
+#    the account cannot change its own authorized_keys.
+for u in backup-server desktop; do
+    if ! getent passwd "$u" >/dev/null; then
+        useradd --system --no-create-home --home-dir "/home/$u" --shell /bin/sh "$u"
+        say "created the account $u"
+    fi
+    usermod -p '*' "$u"
+    install -d -m 755 -o root -g root "/home/$u" "/home/$u/.ssh"
+    if [ -f "$REPO/backup-logins/authorized_keys.$u" ]; then
+        install -m 644 -o root -g root "$REPO/backup-logins/authorized_keys.$u" "/home/$u/.ssh/authorized_keys"
+        say "$u: key installed"
+    else
+        say "$u: no key in the repo yet (backup-logins/authorized_keys.$u)"
+    fi
+done
+
+# 2. The gate, and the only sudo the two accounts get (checked before it lands).
+install -m 755 "$REPO/backup-gate" /usr/local/bin/backup-gate
+visudo -cf "$REPO/backup-logins/sudoers" >/dev/null
+install -m 440 -o root -g root "$REPO/backup-logins/sudoers" /etc/sudoers.d/backup-logins
+visudo -c >/dev/null
+say "backup-gate and /etc/sudoers.d/backup-logins installed"
+
+# 3. Each machine writes into its own folder, and the heartbeat moves into the
+#    backup server's. Group dietpi keeps write access until finish, so a run
+#    with the old scripts still delivers its report.
+chown backup-server:dietpi "$LOGS/backup-server" && chmod 775 "$LOGS/backup-server"
+chown desktop:dietpi "$LOGS/desktop" && chmod 775 "$LOGS/desktop"
+if [ -f "$LOGS/.backup-heartbeat" ] && [ ! -f "$LOGS/backup-server/heartbeat" ]; then
+    cp -p "$LOGS/.backup-heartbeat" "$LOGS/backup-server/heartbeat"
+    chown backup-server:dietpi "$LOGS/backup-server/heartbeat"
+    say "heartbeat copied to $LOGS/backup-server/heartbeat"
+fi
+
+# 4. The laptop jobs that read the heartbeat's new place, or leave the
+#    container list for the login summary (dietpi leaves the docker group).
+install -m 755 "$REPO/machine-reports" "$REPO/check-backup-heartbeat" "$REPO/service-watch" /usr/local/bin/
+say "machine-reports, check-backup-heartbeat, service-watch updated"
+
+# 5. Nothing runs from a backup tree.
+install -m 644 "$REPO"/backup-trees/*.mount /etc/systemd/system/
+systemctl daemon-reload
+for m in "$REPO"/backup-trees/*.mount; do
+    systemctl enable --now "$(basename "$m")"
+done
+say "backup trees mounted nosuid,nodev,noexec"
+
+say "done. Check: sudo -l -U backup-server; findmnt -T /mnt/dietpi-desktop-backup"

@@ -1,0 +1,54 @@
+# ntfy server configuration (https://docs.ntfy.sh/config/).
+# Mounted read-only into the container by compose.yaml.
+
+# The URL the phone uses: the laptop's LAN address, on purpose. Notifications
+# are only wanted at home; away from the house the phone cannot reach this
+# and nothing shows. Messages wait in the cache (see cache-duration) and are
+# fetched when the phone is back on the home network. The iOS app must be
+# given exactly this URL: the instant-delivery relay hashes it. HTTPS since
+# 28 September 2026; it was http://192.168.50.10:8082 before.
+base-url: "https://192.168.50.10:8490"
+
+# Plain HTTP for ntfy-notify, on the laptop itself only. The container runs on
+# the host's network (compose.yaml), so this address is what keeps it there.
+listen-http: "127.0.0.1:8082"
+
+# HTTPS for the phone and the web page, with the laptop's certificate for the
+# home sites (README, "HTTPS for the home sites"), mounted from
+# ~/.config/home-tls. ufw decides who reaches it.
+listen-https: ":8490"
+cert-file: "/certs/laptop.crt"
+key-file: "/certs/laptop.key"
+
+# Nobody reads or writes without logging in. Users and access rules are
+# managed with `docker exec ntfy ntfy user|access|token ...`.
+auth-file: "/var/lib/ntfy/user.db"
+auth-default-access: "deny-all"
+enable-login: true
+enable-signup: false
+
+# Keep a week of messages so nothing is lost while the phone is away.
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "168h"
+
+# Attachments (camera snapshots later on).
+attachment-cache-dir: "/var/cache/ntfy/attachments"
+attachment-total-size-limit: "500M"
+attachment-file-size-limit: "15M"
+attachment-expiry-duration: "168h"
+
+# iOS cannot poll in the background. For every message the server sends an
+# empty "poll now" ping (a hash of the topic URL, no content) through ntfy.sh,
+# which Apple's push service delivers; the app then fetches the real message
+# from this server, which only works on the home network. Away from home the
+# ping is silently useless; the next one at home pulls everything waiting.
+upstream-base-url: "https://ntfy.sh"
+
+log-level: info
+# ntfy writes its log to stderr, and Docker's journald driver files stderr under
+# priority err - so the once-a-minute "Server stats" line was arriving as an
+# error and `journalctl -p err` was ~1440 fake errors a day, burying anything
+# real. This silences that one line (it carries tag=manager) and leaves the rest
+# of INFO, publishes included, where it was.
+log-level-overrides:
+  - "tag=manager -> warn"

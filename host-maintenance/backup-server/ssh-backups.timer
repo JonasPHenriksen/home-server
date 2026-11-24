@@ -1,0 +1,10 @@
+[Unit]
+Description=Run DietPi SSH Backups 5 minutes after boot
+
+[Timer]
+OnBootSec=5min
+Unit=ssh-backups.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

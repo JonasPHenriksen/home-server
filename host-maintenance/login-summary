@@ -1,0 +1,401 @@
+#!/bin/bash
+#
+# login-summary - one screen with the state of this server, printed at login.
+#
+# Called from ~/.bashrc for interactive login shells. ~/.hushlogin keeps the
+# DietPi banner and /etc/motd quiet, so this is the only thing you see.
+#
+#   login-summary            colours when stdout is a terminal
+#   login-summary --plain    never colours (tests, piping)
+#   login-summary --color    always colours
+#
+# Everything comes from files and fast local commands (well under a second in
+# total), nothing needs root, and a source that is missing is simply skipped.
+# Rows wrap to the terminal width. For tests: COLUMNS overrides the width and
+# TAPO_DIR, LOG_DIR, BACKUP_DIR, RUN_DIR, DESKTOP_COPY the paths.
+
+export LC_ALL=C.UTF-8   # dots in numbers whatever the login locale, UTF-8 glyphs
+shopt -s extglob
+
+TAPO_DIR="${TAPO_DIR:-/home/dietpi/tapo-automation}"
+LOG_DIR="${LOG_DIR:-/mnt/dietpi_userdata/logs}"
+BACKUP_DIR="${BACKUP_DIR:-/mnt/dietpi-backup}"
+RUN_DIR="${RUN_DIR:-/run/dietpi}"
+DESKTOP_COPY="${DESKTOP_COPY:-/mnt/dietpi-desktop-backup}"   # the desktop's system tree; mtime = its last backup
+NTFY_CONF="${NTFY_CONF:-/etc/ntfy-notify.conf}"
+SPOOL_DIR="${SPOOL_DIR:-$(sed -n 's/^[[:space:]]*NTFY_SPOOL_DIR[[:space:]]*=[[:space:]]*//p' "${NTFY_CONF}" 2>/dev/null | tail -1)}"
+SPOOL_DIR="${SPOOL_DIR:-/var/spool/ntfy-notify}"
+DOCKER="${DOCKER:-docker}"
+# dietpi is not in the docker group (since 2026-09-27), so `docker ps` is refused at login;
+# service-watch, which runs as root every 2 minutes, leaves the same list here.
+CONTAINERS_FILE="${CONTAINERS_FILE:-/var/lib/service-watch/containers.tsv}"
+
+SERVICES=(pihole-FTL unbound tailscaled docker dropbear ufw cam_recorder tapo_presence status_page earlyoom smartmontools)
+BLOCKED_TEST_DOMAIN=ad.doubleclick.net   # on every default blocklist
+RESOLVE_TEST_DOMAIN=dietpi.com
+
+# --------------------------------------------------------------------------- style
+
+case "$1" in
+    --plain) colour=0 ;;
+    --color|--colour) colour=1 ;;
+    *) [[ -t 1 ]] && colour=1 || colour=0 ;;
+esac
+if (( colour )); then
+    ACC=$'\e[38;5;154m' DIM=$'\e[90m' RED=$'\e[91m' YEL=$'\e[93m' GRN=$'\e[92m' BOLD=$'\e[1m' OFF=$'\e[0m'
+else
+    ACC='' DIM='' RED='' YEL='' GRN='' BOLD='' OFF=''
+fi
+OK='✓' BAD='✗' WARN='!' SEP=' · ' RULE='─' ARROW='→'
+
+cols=${COLUMNS:-$(tput cols 2>/dev/null)}; cols=${cols:-80}
+(( cols < 60 )) && cols=60
+(( cols > 110 )) && cols=110
+INDENT=12   # two spaces, nine for the label, one space
+
+rule()   { local s; printf -v s '%*s' "$((cols - 1))" ''; echo " ${DIM}${s// /$RULE}${OFF}"; }
+vislen() { local s=${1//$'\e'\[*([0-9;])m/}; echo "${#s}"; }
+good()   { echo "${GRN}${OK}${OFF} $1"; }
+bad()    { echo "${RED}${BAD} $1${OFF}"; }
+warn()   { echo "${YEL}${WARN} $1${OFF}"; }
+dim()    { echo "${DIM}$1${OFF}"; }
+
+# wrap PREFIX CONT SEPARATOR ITEM... : the items joined by SEPARATOR and wrapped
+# to the terminal width; the first line starts with PREFIX, the others with CONT
+# (same visible width). An item is only split when it is wider than a whole line
+# on its own (a long package list, say): it then gets lines of its own, broken
+# at its spaces. Colour codes contain no spaces, so a colour simply carries on
+# over the line break.
+wrap() {
+    local prefix="$1" cont="$2" sepr="$3"; shift 3
+    local line="" item word width=$((cols - $(vislen "$cont") - 1))
+    local -a words
+    for item in "$@"; do
+        [[ -z $item ]] && continue
+        if (( $(vislen "$item") > width )); then
+            [[ -n $line ]] && { echo "${prefix}${line}"; prefix="$cont"; }
+            read -ra words <<< "$item"; line="${words[0]}"
+            for word in "${words[@]:1}"; do
+                if (( $(vislen "$line $word") > width )); then
+                    echo "${prefix}${line}"; prefix="$cont"; line="$word"
+                else line+=" $word"; fi
+            done
+            echo "${prefix}${line}"; prefix="$cont"; line=""
+        elif [[ -z $line ]]; then line="$item"
+        elif (( $(vislen "$line$sepr$item") > width )); then
+            echo "${prefix}${line}"; prefix="$cont"; line="$item"
+        else line+="$sepr$item"; fi
+    done
+    [[ -n $line ]] && echo "${prefix}${line}"
+}
+# row LABEL SEPARATOR ITEM... : a labelled row, continuation lines indented under it
+row() { local label; printf -v label '  %s%-9s%s ' "$ACC" "$1" "$OFF"; wrap "$label" "$(printf '%*s' "$INDENT" '')" "${@:2}"; }
+# hdr ITEM... : header items, two-space indent
+hdr() { wrap "  " "  " "$SEP" "$@"; }
+
+# first line of a file, or nothing
+rd() { local v=''; if [[ -r $1 ]]; then read -r v < "$1" || true; fi; printf '%s' "$v"; }
+
+# colour TEXT by a number: level NUMBER WARN_AT BAD_AT TEXT
+level() {
+    local v=${1%%[.,]*}; v=${v:-0}
+    if (( v >= $3 )); then echo "${RED}$4${OFF}"
+    elif (( v >= $2 )); then echo "${YEL}$4${OFF}"
+    else echo "$4"; fi
+}
+
+ago() {   # "5 d ago" from an epoch
+    local d=$(( $(date +%s) - $1 ))
+    if (( d < 3600 )); then echo "$((d / 60)) min ago"
+    elif (( d < 86400 )); then echo "$((d / 3600)) h ago"
+    else echo "$((d / 86400)) d ago"; fi
+}
+until_() {   # "in 1 d 8 h" from an epoch
+    local d=$(( $1 - $(date +%s) ))
+    if (( d < 3600 )); then echo "in $((d / 60)) min"
+    elif (( d < 86400 )); then echo "in $((d / 3600)) h"
+    else echo "in $((d / 86400)) d $(( (d % 86400) / 3600 )) h"; fi
+}
+
+# --------------------------------------------------------------------------- header
+
+host=$(hostname -s 2>/dev/null || hostname)
+os="$(sed -n 's/^NAME="\(.*\)"/\1/p' /etc/os-release 2>/dev/null | sed 's/ GNU\/Linux//') $(sed -n 's/^VERSION_ID="\(.*\)"/\1/p' /etc/os-release 2>/dev/null) $(sed -n 's/^VERSION_CODENAME=\(.*\)/\1/p' /etc/os-release 2>/dev/null)"
+dietpi=$(awk -F= '/^G_DIETPI_VERSION_(CORE|SUB|RC)=/ {gsub(/[^0-9]/, "", $2); v = v (v == "" ? "" : ".") $2} END {print v}' /boot/dietpi/.version 2>/dev/null)
+kernel=$(uname -r); kernel=${kernel%%+*}
+read -r up _ < /proc/uptime; up=${up%.*}
+if (( up >= 86400 )); then uptime="$((up / 86400)) d $(( (up % 86400) / 3600 )) h"
+else uptime="$((up / 3600)) h $(( (up % 3600) / 60 )) min"; fi
+booted=$(date -d "@$(( $(date +%s) - up ))" '+%a %d %b %H:%M')
+
+rule
+hdr "${BOLD}${host}${OFF}" "${os# }" "${dietpi:+DietPi v$dietpi}" "Linux ${kernel}"
+hdr "$(dim "$(date '+%A %d %B %Y, %H:%M %Z')")" "$(dim "up ${uptime} (since ${booted})")"
+rule
+
+# --------------------------------------------------------------------------- system
+
+read -r l1 l5 l15 _ < /proc/loadavg
+cores=$(nproc 2>/dev/null || echo 1)
+load=$(level "$l1" "$cores" "$((cores * 2))" "load $l1 $l5 $l15 (${cores} cores)")
+
+read -r _ mem_total _ _ _ _ mem_avail < <(free -m | awk 'NR==2')
+read -r _ _ swap_used _ < <(free -m | awk 'NR==3')
+mem_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+mem=$(level "$mem_pct" 80 92 "RAM $(awk "BEGIN{printf \"%.1f of %.1f\", ($mem_total-$mem_avail)/1024, $mem_total/1024}") GiB (${mem_pct}%)")
+swap="swap ${swap_used:-0} MiB"; (( ${swap_used:-0} > 512 )) && swap=$(warn "swap ${swap_used} MiB in use")
+
+temp=""
+for z in /sys/class/thermal/thermal_zone*; do
+    [[ $(rd "$z/type") == x86_pkg_temp ]] || continue
+    t=$(( $(rd "$z/temp") / 1000 )); temp=$(level "$t" 75 88 "CPU ${t}°C"); break
+done
+gov=$(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+
+row "System" "$SEP" "$load" "$mem" "$swap" "$temp" "${gov:+$(dim "governor $gov")}"
+
+# --------------------------------------------------------------------------- disk
+
+read -r _ d_size d_used d_avail d_pct _ < <(df -h / | awk 'NR==2')
+disk=$(level "${d_pct%\%}" 80 90 "/ ${d_used} of ${d_size} used (${d_pct}), ${d_avail} free")
+smart_detail="" smart_detail2=""
+if [[ -e $LOG_DIR/DISK_WARNING ]]; then
+    smart=$(bad "DISK WARNING, plan a replacement")
+    smart_detail=$(tail -1 "$LOG_DIR/disk-health.log" 2>/dev/null | awk '{print $3, $4}')
+    smart_detail2=$(tail -1 "$LOG_DIR/disk-health.log" 2>/dev/null | awk '{print $5, $6}')
+elif [[ -s $LOG_DIR/disk-health.log ]]; then
+    smart=$(tail -1 "$LOG_DIR/disk-health.log" | awk -v ok="$(good "SMART")" '{print ok " " substr($3, 8) ", checked " $1}')
+else
+    smart=$(dim "SMART: no weekly check logged yet")
+fi
+row "Disk" "$SEP" "$disk" "$smart" "$smart_detail" "$smart_detail2"
+
+# --------------------------------------------------------------------------- network
+
+lan=$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth|tailscale)/ {sub(/\/.*/, "", $4); print $4 " (" $2 ")"; exit}')
+ts="" ts_peers=""
+if command -v tailscale >/dev/null 2>&1; then
+    ts_json=$(timeout 3 tailscale status --json 2>/dev/null)
+    ts_state=$(awk -F'"' '/"BackendState":/ {print $4; exit}' <<< "$ts_json")
+    ts_ip=$(awk -F'"' '/"TailscaleIPs":/ {getline; print $2; exit}' <<< "$ts_json")
+    ts_online=$(awk '/"Self":/ {s=1} s && /"Online":/ {gsub(/[ ,]/, "", $2); print $2; exit}' <<< "$ts_json")
+    peer_lines=$(timeout 3 tailscale status --self=false --peers 2>/dev/null)
+    peers=$(grep -c . <<< "$peer_lines"); peers_on=$(grep -vc 'offline' <<< "$peer_lines")
+    if [[ $ts_state == Running && $ts_online == true ]]; then
+        ts=$(good "Tailscale ${ts_ip} online"); ts_peers=$(dim "${peers_on} of ${peers} peers online")
+    elif [[ $ts_state == Running ]]; then
+        ts=$(bad "Tailscale ${ts_ip} not connected to the tailnet")
+    else
+        ts=$(bad "Tailscale ${ts_state:-unavailable}")
+    fi
+fi
+row "Network" "$SEP" "LAN ${lan:-none}" "$ts" "$ts_peers"
+
+# --------------------------------------------------------------------------- services
+
+items=()
+for s in "${SERVICES[@]}"; do
+    state=$(systemctl is-active "$s" 2>/dev/null)
+    if [[ $state == active ]]; then items+=("$(good "$s")")
+    else items+=("$(bad "$s ${state:-missing}")"); fi
+done
+failed=$(systemctl --failed --no-legend 2>/dev/null | grep -c .)
+if (( failed > 0 )); then items+=("$(bad "$failed failed unit(s)")"); else items+=("$(dim "no failed units")"); fi
+row "Services" "  " "${items[@]}"
+
+# --------------------------------------------------------------------------- dns
+
+if command -v dig >/dev/null 2>&1; then
+    blocked=$(timeout 3 dig +short +time=2 +tries=1 @127.0.0.1 "$BLOCKED_TEST_DOMAIN" A 2>/dev/null | head -1)
+    ph_detail=$(dim "$BLOCKED_TEST_DOMAIN $ARROW ${blocked:-no answer}")
+    if [[ -z $blocked ]]; then ph=$(bad "Pi-hole: no answer on 127.0.0.1:53")
+    elif [[ $blocked == 0.0.0.0 || $blocked == :: ]]; then ph=$(good "Pi-hole blocking")
+    else ph=$(warn "Pi-hole NOT blocking"); ph_detail=$(warn "$BLOCKED_TEST_DOMAIN $ARROW $blocked"); fi
+    t0=$(date +%s%N)
+    ub=$(timeout 3 dig +short +time=2 +tries=1 @127.0.0.1 -p 5335 "$RESOLVE_TEST_DOMAIN" A 2>/dev/null | head -1)
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    if [[ -n $ub ]]; then ubs="$(good "unbound resolving") $(dim "(${ms} ms)")"; else ubs=$(bad "unbound: no answer on 127.0.0.1:5335"); fi
+    row "DNS" "$SEP" "$ph" "$ph_detail" "$ubs"
+fi
+
+# --------------------------------------------------------------------------- docker
+
+if command -v docker >/dev/null 2>&1 && systemctl is-active docker >/dev/null 2>&1; then
+    items=()
+    list=$(timeout 5 $DOCKER ps -a --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null) || list=""
+    [ -n "$list" ] || list=$(cat "$CONTAINERS_FILE" 2>/dev/null)
+    while IFS=$'\t' read -r name status ports; do
+        [[ -z $name ]] && continue
+        p=$(sed -E 's/0\.0\.0\.0:([0-9]+)->[0-9]+\/tcp/:\1/g; s/, \[::\][^,]*//g; s/,.*//' <<< "$ports")
+        if [[ $status == Up* && $status != *unhealthy* ]]; then items+=("$(good "$name") $(dim "${status}${p:+ $p}")")
+        else items+=("$(bad "$name $status")"); fi
+    done <<< "$list"
+    (( ${#items[@]} )) || items=("$(dim "no containers")")
+    row "Docker" "   " "${items[@]}"
+fi
+
+# Notifications held because the phone is not on the network. Silent when there
+# are none, which is almost always.
+if [[ -d $SPOOL_DIR ]]; then
+    queued=("$SPOOL_DIR"/*.msg)
+    if [[ -e ${queued[0]} ]]; then
+        oldest=$(sed -n 's/^created=//p' "${queued[0]}" 2>/dev/null | head -1)
+        row "Notices" "$SEP" \
+            "$(warn "${#queued[@]} notification(s) waiting for the phone to come home")" \
+            "${oldest:+$(dim "oldest $(ago "$oldest")")}"
+    fi
+fi
+
+rule
+
+# --------------------------------------------------------------------------- cameras
+
+if [[ -d $TAPO_DIR ]]; then
+    state=$(rd "$TAPO_DIR/.tapo_motion_state")
+    fails=$(rd "$TAPO_DIR/.tapo_ping_fail_count"); fails=${fails:-0}
+    thr=$(rd "$TAPO_DIR/.tapo_away_threshold"); thr=${thr:-3}
+    case "$state" in
+        enable)  pres="${YEL}${BOLD}AWAY${OFF} cameras armed, recording" ;;
+        disable) pres="${GRN}${BOLD}HOME${OFF} privacy mode, not recording" ;;
+        *)       pres=$(dim "presence state unknown (no state file yet)") ;;
+    esac
+    if [[ -f $TAPO_DIR/.tapo_probe_error ]]; then phones=$(bad "presence probe failing, assuming someone is home")
+    elif (( fails == 0 )); then phones=$(dim "a phone answered on the last check")
+    else phones=$(warn "no phone for ${fails} checks (arms at ${thr}, ~$((thr * 10 / 60)) min)"); fi
+    pending=""; [[ -f $TAPO_DIR/.tapo_pending ]] && pending=$(warn "camera switch incomplete, retrying")
+    night=$("$TAPO_DIR/night_mode.sh" status 2>/dev/null | head -1)
+    page_port=$(sed -n 's/.*"port": *\([0-9]*\).*/\1/p' "$TAPO_DIR/config.json" 2>/dev/null | head -1)
+    page_scheme=http
+    grep -q '"tls_cert": *"' "$TAPO_DIR/config.json" 2>/dev/null && page_scheme=https
+    page_url=""
+    if [[ -n $page_port ]] && systemctl is-active status_page >/dev/null 2>&1; then
+        page_url=$(dim "${page_scheme}://${lan%% *}:${page_port}")
+    fi
+    row "Cameras" "$SEP" "$pres" "$phones" "$pending" "${night:-night mode: unknown}" "$page_url"
+
+    if [[ -r $TAPO_DIR/recordings/status.json ]]; then
+        mapfile -t cams < <(awk '
+            /^    "[A-Za-z0-9_.-]+": \{$/ { gsub(/[":{ ]/, "", $1); cam = $1 }
+            cam && /"state":/ { gsub(/[",]/, "", $2); st[cam] = $2 }
+            cam && /"failures":/ { gsub(/[",]/, "", $2); fl[cam] = $2 }
+            cam && /"running_for_seconds":/ { gsub(/[",]/, "", $2); rf[cam] = $2 }
+            /^    \}/ { cam = "" }
+            END { for (c in st) print c, st[c], (rf[c] == "null" || rf[c] == "" ? "-" : int(rf[c] / 60)), fl[c] + 0 }' "$TAPO_DIR/recordings/status.json" | sort)
+        items=()
+        for c in "${cams[@]}"; do
+            read -r name st mins fl <<< "$c"
+            case "$st" in
+                recording) it="$(good "$name recording") $(dim "${mins} min")" ;;
+                backoff)   it=$(bad "$name backoff") ;;
+                *)         it="$name $(dim "$st")" ;;
+            esac
+            items+=("$it")
+            (( ${fl:-0} > 0 )) && items+=("$(warn "${fl} failures")")
+        done
+        (( ${#items[@]} )) && items[0]="recorder: ${items[0]}"
+        row "" "  " "${items[@]}"
+    fi
+    if [[ -d $TAPO_DIR/recordings ]]; then
+        size=$(du -sh "$TAPO_DIR/recordings" 2>/dev/null | cut -f1)
+        count=$(find "$TAPO_DIR/recordings" -name '*.mp4' 2>/dev/null | wc -l)
+        newest=$(find "$TAPO_DIR/recordings" -name '*.mp4' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+        if [[ -n $newest ]]; then
+            when=$(basename "$newest" .mp4 | sed 's/_/ /; s/-\(..\)-\(..\)$/:\1/')
+            newest_txt="newest ${when} ($(basename "$(dirname "$newest")"))"
+        else newest_txt="no segments yet"; fi
+        retain=$(sed -n 's/.*"retain_days": *\([0-9.]*\).*/\1/p' "$TAPO_DIR/config.json" 2>/dev/null | head -1)
+        row "" "$SEP" "recordings: ${size:-0} in ${count} segments" "$newest_txt" "${retain:+$(dim "kept ${retain} days")}"
+    fi
+    if [[ -s $TAPO_DIR/tapo.log ]]; then
+        last=$(tail -1 "$TAPO_DIR/tapo.log")
+        [[ $last == "$(date +%F)"* ]] && last="today ${last:11}"
+        row "" "" "$(dim "last event: ${last:0:$((cols - INDENT - 13))}")"
+    fi
+    rule
+fi
+
+# --------------------------------------------------------------------------- updates and maintenance
+
+apt_n=$(rd "$RUN_DIR/.apt_updates"); apt_n=${apt_n:-0}
+if (( apt_n > 0 )); then upd=$(warn "${apt_n} APT package(s) waiting"); else upd="APT up to date"; fi
+if [[ -f $RUN_DIR/.update_available ]]; then dpu=$(warn "DietPi update available")
+elif [[ -f $RUN_DIR/.live_patches ]]; then dpu=$(warn "DietPi live patches available")
+else dpu="DietPi up to date"; fi
+newest_k=$(dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null | grep -v unsigned | sort -V | tail -1 | sed 's/^linux-image-//')
+if [[ -n $newest_k && $newest_k != "$(uname -r)" ]]; then kern=$(warn "reboot pending for kernel $newest_k")
+else kern=$(dim "kernel is the newest installed"); fi
+if [[ -s $LOG_DIR/security-upgrades.log ]]; then
+    sl=$(tail -1 "$LOG_DIR/security-upgrades.log")
+    s_when=$(date -d "$(cut -d' ' -f1,2 <<< "$sl")" '+%a %d %b' 2>/dev/null); s_what=$(cut -d' ' -f3- <<< "$sl")
+    case "$s_what" in
+        WARNING*)   sec=$(bad "security fixes ${s_when}: ${s_what#WARNING: }") ;;
+        installed*) sec=$(good "security fixes ${s_when}: ${s_what}") ;;
+        skipped*)   reason=${s_what#skipped: }; sec=$(dim "security fixes ${s_when}: skipped (${reason%%,*})") ;;
+        *)          sec=$(good "security fixes ${s_when}: ${s_what}") ;;
+    esac
+else
+    sec=$(dim "security fixes: no daily run logged yet")
+fi
+row "Updates" "$SEP" "$upd" "$dpu" "$kern" "$sec"
+
+if [[ -s $LOG_DIR/maintenance-status.log ]]; then
+    ml=$(tail -1 "$LOG_DIR/maintenance-status.log")
+    m_when=$(date -d "$(cut -d' ' -f1,2 <<< "$ml")" '+%a %d %b %H:%M' 2>/dev/null); m_what=$(cut -d' ' -f3- <<< "$ml")
+    case "$m_what" in
+        "finished, 0 failure(s)") m_txt=$(good "${m_when}: finished, no failures") ;;
+        aborted*)                 m_txt=$(bad "${m_when}: $m_what") ;;
+        *)                        m_txt=$(warn "${m_when}: $m_what") ;;
+    esac
+else
+    m_txt=$(dim "no weekly run logged yet")
+fi
+# cron.weekly runs on Sundays at 03:30 host time (see /etc/crontab)
+now=$(date +%s)
+next=$(date -d "sunday 03:30" +%s 2>/dev/null)
+[[ -n $next ]] && (( next <= now )) && next=$(date -d "next sunday 03:30" +%s 2>/dev/null)
+next_txt=""; [[ -n $next ]] && next_txt="next $(date -d "@$next" '+%a %d %b %H:%M') $(dim "($(until_ "$next"))")"
+row "Weekly" "$SEP" "$m_txt" "$next_txt"
+
+bk=$(dim "no dietpi-backup found under ${BACKUP_DIR}") bk_copies=""
+if [[ -r $BACKUP_DIR/.dietpi-backup_stats ]]; then
+    bl=$(grep 'Backup completed' "$BACKUP_DIR/.dietpi-backup_stats" | tail -1 | cut -d' ' -f1)
+    if [[ -n $bl ]]; then
+        b_epoch=$(date -d "${bl/_/ }" +%s 2>/dev/null)
+        copies=$(find "$BACKUP_DIR" -maxdepth 1 -type d -name 'data*' 2>/dev/null | wc -l)
+        age_d=$(( (now - b_epoch) / 86400 ))
+        bk=$(level "$age_d" 8 15 "dietpi-backup $(date -d "@$b_epoch" '+%a %d %b %H:%M') ($(ago "$b_epoch"))")
+        bk_copies=$(dim "${copies} rotating copies")
+    fi
+fi
+# The newest report of the backup server and of the desktop (machine-reports
+# reads them in full and pushes their problems): when, and whether it went well.
+# The desktop is switched on when needed, so a month without it is still normal,
+# and its backup copy here says when it last backed up even without a report.
+reports=()
+for m in backup-server desktop; do
+    rep=$(ls -1 "$LOG_DIR/$m"/report-*.txt 2>/dev/null | tail -n 1)
+    r_status="" r_epoch=""
+    if [[ -n $rep ]]; then
+        r_status=$(sed -n 's/^status=//p' "$rep" | head -n 1)
+        r_epoch=$(date -d "$(sed -n 's/^finished=//p' "$rep" | head -n 1)" +%s 2>/dev/null)
+    fi
+    warn_d=8 bad_d=15
+    if [[ $m == desktop ]]; then
+        warn_d=31 bad_d=45
+        c_epoch=$(stat -c %Y "$DESKTOP_COPY" 2>/dev/null)
+        if [[ -n $c_epoch ]] && { [[ -z $r_epoch ]] || (( c_epoch > r_epoch + 3600 )); }; then
+            reports+=("$(level $(( (now - c_epoch) / 86400 )) $warn_d $bad_d "desktop backup $(date -d "@$c_epoch" '+%a %d %b %H:%M') ($(ago "$c_epoch"))")")
+            continue
+        fi
+    fi
+    [[ -n $r_epoch ]] || continue
+    r_txt="${m/-/ } $(date -d "@$r_epoch" '+%a %d %b %H:%M')"
+    [[ $m == desktop ]] && r_txt+=" ($(ago "$r_epoch"))"
+    if [[ $r_status == ok ]]; then reports+=("$(level $(( (now - r_epoch) / 86400 )) $warn_d $bad_d "$r_txt ok")")
+    else reports+=("$(bad "$r_txt: problems, see machine-reports --status")"); fi
+done
+row "Backups" "$SEP" "$bk" "$bk_copies" "${reports[@]}"
+
+rule
+row "" "$SEP" "$(dim "htop")" "$(dim "dietpi-launcher")" "$(dim "tail -f ~/tapo-automation/tapo.log")" "$(dim "sudo docker ps")"
+echo

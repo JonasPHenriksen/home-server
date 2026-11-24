@@ -1,0 +1,8 @@
+[Unit]
+Description=Run DietPi Backup and Sync with Server
+After=network.target time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dietpi-backup-sync.sh
+TimeoutStartSec=0

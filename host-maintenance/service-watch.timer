@@ -1,0 +1,11 @@
+[Unit]
+Description=Run service-watch every two minutes
+
+[Timer]
+# Three minutes after boot gives the services time to come up first.
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

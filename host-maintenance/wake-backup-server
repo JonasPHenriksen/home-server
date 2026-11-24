@@ -1,0 +1,33 @@
+#!/bin/bash
+#
+# Runs once at boot (wake-backup-server.service). If the weekly maintenance job
+# left a flag before rebooting, wake the backup server now, when this machine is
+# back up and its backup data is stable. Doing it here instead of before the
+# reboot means the backup server can never catch the laptop mid-reboot.
+
+#
+# The backup server is meant to be off. When it already answers a ping here, it
+# was left on: the wake-up does nothing, and since its run only starts at boot,
+# this week's backup will not happen. That goes into the weekly push (through
+# .weekly-summary), which machine-reports then sends at once instead of waiting
+# for a report that will not come. A ping is not a login: the laptop still has
+# no way into the backup server.
+
+FLAG="${FLAG:-/mnt/dietpi_userdata/logs/.wake-backup-server}"
+MAC="${MAC:-02:00:00:00:00:30}"     # backup server
+IP="${IP:-192.168.50.30}"
+LOG="${LOG:-/mnt/dietpi_userdata/logs/weekly-updater.log}"
+SUMMARY="${SUMMARY:-/mnt/dietpi_userdata/logs/.weekly-summary}"
+
+[ -f "$FLAG" ] || exit 0
+sleep "${SETTLE_SECS:-30}"           # let the network come up properly
+if ping -c 2 -W 2 "$IP" >/dev/null 2>&1; then
+    echo "$(date -u '+%Y-%m-%d %H:%M:%S') WARNING: the backup server ($IP) was already on, so its weekly run will not start" >> "$LOG"
+    [ -f "$SUMMARY" ] && echo "backup_server_was_on=yes" >> "$SUMMARY"
+fi
+if /usr/bin/wakeonlan "$MAC" >/dev/null; then
+    rm -f "$FLAG"
+    echo "$(date -u '+%Y-%m-%d %H:%M:%S') woke the backup server ($MAC) after the reboot" >> "$LOG"
+else
+    echo "$(date -u '+%Y-%m-%d %H:%M:%S') WARNING: could not send Wake-on-LAN to $MAC, flag kept for next boot" >> "$LOG"
+fi

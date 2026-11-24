@@ -1,0 +1,119 @@
+#!/bin/bash
+#
+# check-backup-heartbeat - warn when the backup server stops checking in.
+#
+# The backup server (192.168.50.30) is awake roughly half an hour a week and
+# powered off the rest of the time. It therefore cannot warn anyone that it has
+# died: a failed upgrade, a dead disk, a dead power supply and an unplugged
+# cable all look identical from there, which is to say they look like nothing
+# at all. This machine is always on, so this is the only place the alarm can
+# live.
+#
+# At the end of every cycle the backup server writes a small status file here.
+# This checks that the file is recent and pushes a notification when it is
+# not; a cycle that reported failures is logged here and pushed, with the
+# reasons from its full report, by machine-reports.
+#
+#   check-backup-heartbeat           normal run (used by the timer)
+#   check-backup-heartbeat --status  print current state, never notifies
+#   check-backup-heartbeat --test    send a test notification and exit
+#
+set -u
+
+HEARTBEAT="${HEARTBEAT:-/mnt/dietpi_userdata/logs/backup-server/heartbeat}"
+STATE="${STATE:-/mnt/dietpi_userdata/logs/.backup-heartbeat-alerted}"
+# Own log file. The weekly maintenance job rewrites weekly-updater.log from
+# scratch every run (main > log), which was silently erasing this check's
+# history once a week.
+LOG="${LOG:-/mnt/dietpi_userdata/logs/backup-heartbeat.log}"
+NOTIFY="${NOTIFY:-/usr/local/bin/ntfy-notify}"
+
+# The cycle is weekly. Two days of slack absorbs a skipped week without crying
+# wolf, while still catching a genuinely dead server well before you need it.
+MAX_AGE_DAYS="${MAX_AGE_DAYS:-9}"
+
+log() { echo "$(date -u '+%Y-%m-%d %H:%M:%S') check-backup-heartbeat: $1" >> "$LOG" 2>/dev/null; }
+
+notify() {  # notify <priority> <tags> <title> <body>
+    if [ -x "$NOTIFY" ]; then
+        "$NOTIFY" -p "$1" -t "$2" "$3" "$4" >/dev/null 2>&1 \
+            && log "notified: $3" \
+            || log "WARNING: ntfy-notify failed for: $3"
+    else
+        log "WARNING: $NOTIFY not executable, cannot notify: $3"
+    fi
+}
+
+case "${1:-}" in
+--test)
+    notify default backup,white_check_mark "Backup heartbeat test" \
+        "If you can read this, alerting from $(hostname) works."
+    echo "test notification sent (check $LOG)"
+    exit 0
+    ;;
+--status)
+    if [ -r "$HEARTBEAT" ]; then
+        echo "heartbeat file: $HEARTBEAT"
+        sed 's/^/  /' "$HEARTBEAT"
+        echo "  age: $(( ( $(date +%s) - $(stat -c %Y "$HEARTBEAT") ) / 86400 )) day(s)"
+    else
+        echo "no heartbeat file at $HEARTBEAT"
+    fi
+    echo "alert state: $(cat "$STATE" 2>/dev/null || echo none)"
+    exit 0
+    ;;
+esac
+
+now=$(date +%s)
+
+# --- never checked in at all ------------------------------------------------
+if [ ! -r "$HEARTBEAT" ]; then
+    # Only nag once a day about this, not once per timer firing.
+    if [ "$(cat "$STATE" 2>/dev/null)" != "missing-$(date +%F)" ]; then
+        notify high backup,rotating_light "Backup server has never checked in" \
+            "No heartbeat file at $HEARTBEAT. Either the backup server has not completed a cycle since this check was installed, or it cannot reach this machine."
+        echo "missing-$(date +%F)" > "$STATE" 2>/dev/null
+    fi
+    log "no heartbeat file"
+    exit 1
+fi
+
+hb_epoch=$(stat -c %Y "$HEARTBEAT" 2>/dev/null || echo 0)
+age_days=$(( (now - hb_epoch) / 86400 ))
+
+# Values written by the backup server.
+hb_time=$(sed -n 's/^last_cycle=//p' "$HEARTBEAT" | tail -1)
+hb_status=$(sed -n 's/^status=//p' "$HEARTBEAT" | tail -1)
+hb_failures=$(sed -n 's/^failures=//p' "$HEARTBEAT" | tail -1)
+hb_free=$(sed -n 's/^free_gb=//p' "$HEARTBEAT" | tail -1)
+
+problem=0
+
+# --- stale ------------------------------------------------------------------
+if [ "$age_days" -ge "$MAX_AGE_DAYS" ]; then
+    problem=1
+    # Staleness is worth repeating daily: it means the server is still down.
+    if [ "$(cat "$STATE" 2>/dev/null)" != "stale-$(date +%F)" ]; then
+        notify high backup,rotating_light "Backup server has not run for ${age_days} days" \
+            "Last completed cycle: ${hb_time:-unknown}. Expected at least one every 7 days. The backup server may have failed to boot, failed an upgrade, or lost its disk. Nothing is being backed up until this is fixed."
+        echo "stale-$(date +%F)" > "$STATE" 2>/dev/null
+    fi
+    log "STALE: ${age_days} days since ${hb_time:-unknown}"
+fi
+
+# --- last cycle reported failures -------------------------------------------
+# Only logged here. The cycle's full report says why it failed, and
+# machine-reports pushes that: in the weekly push for the Sunday run, on its
+# own for a run at any other time.
+if [ "$problem" = "0" ] && [ "${hb_status:-}" != "ok" ]; then
+    problem=1
+    log "cycle reported failures: status=${hb_status:-?} failures=${hb_failures:-?} (machine-reports pushes the details)"
+fi
+
+if [ "$problem" = "0" ]; then
+    # Clear the alert state so the next genuine problem notifies immediately.
+    rm -f "$STATE" 2>/dev/null
+    log "ok: last cycle ${hb_time:-unknown}, ${age_days}d ago, ${hb_free:-?} GB free"
+    exit 0
+fi
+exit 1

@@ -1,0 +1,1014 @@
+#!/usr/bin/python3
+"""
+wake-page: a small HTTPS page, behind a password, that shows whether the
+home's computers are on, for how long, and wakes them. Devices are added and
+removed on the page itself. See README, The wake page. Standard library only;
+wake-page.service runs it as dietpi.
+
+Wake-on-LAN is a broadcast on the home network, and Tailscale does not carry
+broadcasts, so this laptop, which is always on, sends it when the button is
+pressed: at home, or away over the tailnet.
+
+"On" and "for how long" are what the laptop sees. It checks each device every
+CHECK_SECS, by ping or, for one that ignores ping (a firewall, like the PC's),
+by the kernel's ARP table: a device that is on answers ARP whatever its
+firewall says. The time on counts from the first check that saw it on. While
+the desktop is on, the page also asks whether Nextcloud and Open WebUI answer,
+so it shows when the desktop is ready to use, and it can shut the desktop down:
+an SSH login with the page's own key, which the desktop allows to run nothing
+but its shutdown.
+
+    wake-page                  serve on port 8443
+    wake-page --set-password   ask for the password; only a hash is kept
+
+The certificate is the laptop's one for all the home sites, from
+~/.config/home-tls (home-certs makes it). The page's own files are in
+~/.config/wake-page (700): machines.json (the devices, added, edited and
+removed on the page; the first start writes DEFAULT_MACHINES into it),
+password (a scrypt hash), secret (signs the login cookie), state.json (what
+the checks saw), shutdown_key (the shut-down login) and known_hosts.
+"""
+import argparse
+import copy
+import getpass
+import hashlib
+import hmac
+import html
+import http.client
+import ipaddress
+import json
+import os
+import re
+import signal
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+DIR = Path(os.environ.get("WAKE_PAGE_DIR") or Path.home() / ".config" / "wake-page")
+TLS_DIR = Path(os.environ.get("HOME_TLS_DIR") or Path.home() / ".config" / "home-tls")
+CERT, KEY, CA = TLS_DIR / "laptop.crt", TLS_DIR / "laptop.key", TLS_DIR / "ca.crt"
+SHUTDOWN_KEY, KNOWN_HOSTS = DIR / "shutdown_key", DIR / "known_hosts"
+PORT = int(os.environ.get("WAKE_PAGE_PORT", "8443"))
+BIND = os.environ.get("WAKE_PAGE_BIND", "0.0.0.0")
+CHECK_SECS = float(os.environ.get("WAKE_PAGE_CHECK_SECS", "15"))
+
+LAN = ipaddress.ip_network("192.168.50.0/24")
+BROADCAST = str(LAN.broadcast_address)
+# What the first start writes into machines.json; from then on, the list on the page counts.
+DEFAULT_MACHINES = {               # the name in the URL: what the page knows about the device
+    "desktop": {"label": "Desktop", "ip": "192.168.50.20", "mac": "02:00:00:00:00:20", "check": "ping",
+                "services": {"Nextcloud": "https://192.168.50.20/nextcloud/status.php",
+                             "Open WebUI": "https://192.168.50.20:3443/health"},
+                "shutdown": "dietpi"},     # the user its shut-down key logs in as (README, The wake page)
+    "pc": {"label": "PC", "ip": "192.168.50.21", "mac": "02:00:00:00:00:21",
+           "check": "arp"},        # ignores ping
+}
+MAX_MACHINES = 20
+OFF_AFTER = 2          # checks in a row without an answer before "on" turns to "off"
+ARP_WAIT_SECS = 10     # the kernel settles an ARP check within ~8 s (5 s delay, 3 probes)
+GAP_SECS = 15 * 60     # after a longer break the page no longer knows how long anything was on
+WAKE_WAIT_SECS = 3 * 60
+SESSION_DAYS = 30
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def write_private(path, text):
+    tmp = path.with_name(path.name + ".tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+# --- the devices -----------------------------------------------------------
+
+MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}[:-]?){5}[0-9A-Fa-f]{2}")
+
+
+def normal_mac(mac):
+    hexes = re.sub(r"[^0-9A-Fa-f]", "", mac).upper()
+    return ":".join(hexes[i:i + 2] for i in range(0, 12, 2))
+
+
+def clean_device(label, ip, mac, check):
+    """A device's fields, tidied, or a ValueError that says what to fix. An
+    empty MAC stays empty: the page looks it up."""
+    label = " ".join(str(label).split())
+    if not 1 <= len(label) <= 40 or not label.isprintable():
+        raise ValueError("Give it a name of up to 40 characters.")
+    try:
+        addr = ipaddress.IPv4Address(str(ip).strip())
+    except ValueError:
+        raise ValueError("The IP address should look like 192.168.50.23.") from None
+    if addr not in LAN or addr in (LAN.network_address, LAN.broadcast_address):
+        raise ValueError(f"The IP address has to be on the home network, {LAN}.")
+    mac = str(mac).strip()
+    if mac:
+        if not MAC_RE.fullmatch(mac):
+            raise ValueError("The MAC address should look like 02:00:00:00:00:20.")
+        mac = normal_mac(mac)
+        if int(mac[:2], 16) & 1:
+            raise ValueError("That MAC address is for a group of devices, not for one.")
+    if check not in ("ping", "arp"):
+        raise ValueError("Choose how the page tells it is on: ping or ARP.")
+    return label, str(addr), mac, check
+
+
+def moved(url, old_ip, new_ip):
+    """A site check's address, moved to the device's new IP if it used the old one."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.hostname != old_ip:
+        return url
+    return urllib.parse.urlunsplit(parts._replace(netloc=new_ip + (f":{parts.port}" if parts.port else "")))
+
+
+def slug(label, taken):
+    base = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:30].strip("-") or "device"
+    name, n = base, 2
+    while name in taken:
+        name, n = f"{base}-{n}", n + 1
+    return name
+
+
+def load_machines(path):
+    """The devices in machines.json; a first start writes the defaults there.
+    A broken file is a ValueError, and the page does not overwrite it."""
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        write_private(path, json.dumps(DEFAULT_MACHINES, indent=2) + "\n")
+        return copy.deepcopy(DEFAULT_MACHINES)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} does not hold a list of devices")
+    for name, m in data.items():
+        try:
+            if not re.fullmatch(r"[a-z0-9-]{1,40}", name):
+                raise ValueError("the name may only have a-z, 0-9 and -")
+            if not clean_device(m["label"], m["ip"], m["mac"], m["check"])[2]:
+                raise ValueError("no MAC address")
+            if not isinstance(m.get("services", {}), dict):
+                raise ValueError("services must be names and addresses")
+            if "shutdown" in m and not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", str(m["shutdown"])):
+                raise ValueError("shutdown must be the user to log in as on the device")
+        except (ValueError, LookupError, TypeError) as e:
+            raise ValueError(f"{path}, device {name!r}: {e}") from None
+    return data
+
+
+# --- checking them ---------------------------------------------------------
+
+def run(*cmd):
+    """A command's exit status, or None when it could not run."""
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def neighbour(ip):
+    """The kernel's ARP entry for an address: its state and MAC, or Nones."""
+    try:
+        out = subprocess.run(["ip", "-j", "neigh", "show", ip], capture_output=True, text=True, timeout=10).stdout
+        entry = json.loads(out)[0]
+        return entry["state"][0], entry.get("lladdr")
+    except (OSError, subprocess.SubprocessError, ValueError, LookupError, TypeError, AttributeError):
+        return None, None
+
+
+def is_on(ip, how):
+    """True or False, or None when this check cannot tell."""
+    rc = run("ping", "-c", "1", "-W", "1", "-q", ip)
+    if rc == 0:
+        return True
+    if rc != 1:                    # ping itself failed
+        return None
+    if how == "ping":
+        return False
+    # The ping made the kernel check its ARP entry for the device; wait for
+    # the verdict. REACHABLE: it answered ARP in the last half minute or so.
+    # FAILED: nothing answered.
+    for _ in range(ARP_WAIT_SECS):
+        state = neighbour(ip)[0]
+        if state in ("REACHABLE", "FAILED"):
+            return state == "REACHABLE"
+        time.sleep(1)
+    return None
+
+
+def look_at(ip):
+    """Ping a device once and wait for its ARP entry: whether it answers ping,
+    and its MAC if anything at all answered at that address."""
+    pinged = run("ping", "-c", "1", "-W", "1", "-q", ip) == 0
+    for _ in range(ARP_WAIT_SECS):
+        state, mac = neighbour(ip)
+        if pinged or state in ("REACHABLE", "FAILED"):
+            break
+        time.sleep(1)
+    return pinged, (mac if pinged or state == "REACHABLE" else None)
+
+
+def service_up(url):
+    """Whether a web service answers, and is not in maintenance (Nextcloud).
+    Nothing secret is sent, so its certificate is not checked: the desktop's
+    Nextcloud still has one of its own."""
+    tls = ssl.create_default_context()
+    tls.check_hostname = False
+    tls.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(url, timeout=5, context=tls) as r:
+            body = r.read(65536)
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return True
+    return not (isinstance(data, dict) and data.get("maintenance"))
+
+
+def wake(mac):
+    return run("wakeonlan", "-i", BROADCAST, mac) == 0
+
+
+def shut_down(user, ip):
+    """Switch a device off: an SSH login with the page's key, which the device's
+    authorized_keys allows to run nothing but its shutdown (a forced command).
+    None when that went out, otherwise what went wrong."""
+    if not SHUTDOWN_KEY.is_file():
+        return "the page has no shut-down key (README, The wake page)"
+    cmd = ["ssh", "-F", "none", "-T", "-i", str(SHUTDOWN_KEY), "-o", "IdentitiesOnly=yes",
+           "-o", "IdentityAgent=none", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+           "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+           "-l", user, ip]
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e)
+    # a machine on its way down may close the session before it reports back
+    if r.returncode == 0 or "closed by remote host" in r.stderr:
+        return None
+    lines = [line.strip() for line in r.stderr.splitlines() if line.strip()]
+    return lines[-1] if lines else f"ssh ended with {r.returncode}"
+
+
+def new_state():
+    return {"on": None, "since": None, "exact": False, "wake": None, "halt": None, "services": {}}
+
+
+class Watcher:
+    """Knows the devices, checks each in a thread of its own, and remembers
+    since when each one is on or off."""
+
+    def __init__(self, directory):
+        self.machines_path = directory / "machines.json"
+        self.state_path = directory / "state.json"
+        self.lock = threading.Lock()
+        self.machines = load_machines(self.machines_path)
+        self.state = {n: new_state() for n in self.machines}
+        self.misses = {}
+        self.threads = {}           # name: the token of the one thread that checks it
+        self.saved = 0.0
+        try:
+            data = json.loads(self.state_path.read_text())
+            fresh = time.time() - data["checked"] < GAP_SECS
+        except (OSError, ValueError, LookupError, TypeError):
+            return
+        for n, s in self.state.items():
+            old = data.get(n) or {}
+            if fresh:
+                s.update((k, old[k]) for k in s if k in old)
+            else:          # away too long to know what happened meanwhile
+                s["wake"] = old.get("wake")
+
+    def start(self):
+        with self.lock:
+            for name in self.machines:
+                self._start(name)
+
+    def _start(self, name):             # with the lock held
+        token = object()
+        self.threads[name] = token
+        threading.Thread(target=self.watch, args=(name, token), daemon=True).start()
+
+    def _current(self, name, token):    # with the lock held
+        return name in self.state and (token is None or self.threads.get(name) is token)
+
+    def machine(self, name):
+        with self.lock:
+            m = self.machines.get(name)
+            return copy.deepcopy(m) if m else None
+
+    @staticmethod
+    def _fields(label, ip, mac, check):
+        """clean_device, with the MAC looked up when it was left empty."""
+        label, ip, mac, check = clean_device(label, ip, mac, check)
+        if not mac:
+            pinged, found = look_at(ip)
+            if not found:
+                raise ValueError(f"Nothing answered at {ip}, so its MAC address could not be looked up. "
+                                 "Is it on? Or type the MAC address in.")
+            if check == "ping" and not pinged:
+                raise ValueError(f"{ip} is there but does not answer ping (a firewall, like Windows'): "
+                                 "choose ARP.")
+            mac = normal_mac(found)
+        return label, ip, mac, check
+
+    def _unique(self, label, ip, mac, other_than=None):     # with the lock held
+        for n, m in self.machines.items():
+            if n == other_than:
+                continue
+            if m["label"].casefold() == label.casefold():
+                raise ValueError(f"There is a device called {m['label']} already.")
+            if m["ip"] == ip:
+                raise ValueError(f"{m['label']} has that IP address already.")
+            if m["mac"] == mac:
+                raise ValueError(f"{m['label']} has that MAC address already.")
+
+    def add(self, label, ip, mac, check):
+        """Add a device and start checking it. Returns its name and entry; a
+        ValueError says what to fix, an OSError that the list could not be saved."""
+        label, ip, mac, check = self._fields(label, ip, mac, check)
+        with self.lock:
+            if len(self.machines) >= MAX_MACHINES:
+                raise ValueError(f"The page takes up to {MAX_MACHINES} devices.")
+            self._unique(label, ip, mac)
+            name = slug(label, self.machines)
+            entry = {"label": label, "ip": ip, "mac": mac, "check": check}
+            machines = dict(self.machines, **{name: entry})
+            self._save_machines(machines)       # nothing changes if this fails
+            self.machines = machines
+            self.state[name] = new_state()
+            self._start(name)
+        return name, dict(entry)
+
+    def edit(self, name, label, ip, mac, check):
+        """Change a device. It keeps its place on the list, its address on the
+        page and its site checks, which move along if the IP changes. Returns
+        the old and the new entry: a LookupError when there is no such device,
+        a ValueError says what to fix, an OSError that the list could not be saved."""
+        if self.machine(name) is None:
+            raise LookupError(name)
+        label, ip, mac, check = self._fields(label, ip, mac, check)
+        with self.lock:
+            old = self.machines.get(name)
+            if old is None:
+                raise LookupError(name)
+            self._unique(label, ip, mac, other_than=name)
+            new = dict(old, label=label, ip=ip, mac=mac, check=check)
+            if old.get("services") and ip != old["ip"]:
+                new["services"] = {s: moved(u, old["ip"], ip) for s, u in old["services"].items()}
+            machines = dict(self.machines)
+            machines[name] = new
+            self._save_machines(machines)       # nothing changes if this fails
+            self.machines = machines
+            if (ip, check) != (old["ip"], old["check"]):
+                # another address, or another way to check it: what the page
+                # knew about it no longer holds, and a new thread checks it
+                self.state[name] = new_state()
+                self.misses.pop(name, None)
+                self._start(name)
+        self.save()
+        return copy.deepcopy(old), copy.deepcopy(new)
+
+    def remove(self, name):
+        """Take a device off the list. Returns its entry, or None if there was none."""
+        with self.lock:
+            if name not in self.machines:
+                return None
+            machines = {k: v for k, v in self.machines.items() if k != name}
+            self._save_machines(machines)
+            entry = self.machines[name]
+            self.machines = machines
+            for d in (self.state, self.misses, self.threads):     # its thread sees it is gone
+                d.pop(name, None)
+        self.save()
+        return entry
+
+    def _save_machines(self, machines):  # with the lock held
+        write_private(self.machines_path, json.dumps(machines, indent=2) + "\n")
+
+    def record(self, name, on, now=None, token=None):
+        """Take one check's answer (True, False or None) and save any change."""
+        now = time.time() if now is None else now
+        flip = None
+        with self.lock:
+            if not self._current(name, token):
+                return                  # removed meanwhile, or added again
+            s = self.state[name]
+            if on:
+                self.misses.pop(name, None)
+                if s["on"] is not True:
+                    flip = (True, now)
+            elif on is False:
+                count, first = self.misses.get(name, (0, now))
+                self.misses[name] = (count + 1, first)
+                if s["on"] is None or (s["on"] and count + 1 >= OFF_AFTER):
+                    flip = (False, first)
+            if flip:
+                # exact: a check saw it the other way first. Right after a
+                # start the page only knows "at least".
+                s.update(on=flip[0], since=flip[1], exact=s["on"] is not None)
+            label = self.machines[name]["label"]
+        if flip:
+            log(f"{label} is {'on' if flip[0] else 'off'}")
+        if flip or now - self.saved >= 300:
+            self.save(now)       # also every 5 min, so a restart can tell how long it was away
+
+    def record_services(self, name, services, token=None):
+        with self.lock:
+            if self._current(name, token):
+                self.state[name]["services"] = services
+
+    def woke(self, name):
+        with self.lock:
+            if name in self.state:
+                self.state[name]["wake"] = time.time()
+        self.save()
+
+    def halted(self, name):
+        with self.lock:
+            if name in self.state:
+                self.state[name]["halt"] = time.time()
+        self.save()
+
+    def save(self, now=None):
+        with self.lock:
+            self.saved = time.time() if now is None else now
+            try:
+                write_private(self.state_path, json.dumps(dict(self.state, checked=self.saved)))
+            except OSError as e:
+                log(f"could not save {self.state_path}: {e}")
+
+    def snapshot(self):
+        with self.lock:
+            return copy.deepcopy(self.machines), copy.deepcopy(self.state)
+
+    def watch(self, name, token):
+        while True:
+            with self.lock:
+                if not self._current(name, token):
+                    return              # removed, or added again with a thread of its own
+                m = copy.deepcopy(self.machines[name])
+            try:
+                on = is_on(m["ip"], m["check"])
+                self.record(name, on, token=token)
+                self.record_services(name, {s: service_up(u) for s, u in m.get("services", {}).items()}
+                                     if on else {}, token)
+            except Exception as e:           # one bad check must not end the watching
+                log(f"checking {m['label']} failed: {e!r}")
+            time.sleep(CHECK_SECS)
+
+
+# --- what the page says ---------------------------------------------------
+
+def span(secs):
+    m = max(0, int(secs // 60))
+    if m < 60:
+        return f"{m} min" if m else "less than a minute"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h} h {m} min" if m else f"{h} h"
+    d, h = divmod(h, 24)
+    return (f"{d} day" if d == 1 else f"{d} days") + (f" {h} h" if h else "")
+
+
+def describe(s, now):
+    if s["on"] is None:
+        return "Checking…"
+    text = "On" if s["on"] else "Off"
+    if s["since"] is None or (not s["exact"] and now - s["since"] < 60):
+        return text
+    return f"{text} for {'' if s['exact'] else 'at least '}{span(now - s['since'])}"
+
+
+def wake_note(s, now):
+    """What became of the last wake-up, while the device has not answered."""
+    w = s.get("wake")
+    if s["on"] or not w or now - w > 10 * 60 or (s["since"] or 0) > w:   # off again since: old news
+        return ""
+    if now - w < WAKE_WAIT_SECS:
+        return f"Wake-up sent {span(now - w)} ago, waiting for it to answer."
+    return f"Still no answer {span(now - w)} after the wake-up."
+
+
+def halt_note(s, now):
+    """What became of the last shut-down, while the device still answers."""
+    h = s.get("halt")
+    if not s["on"] or not h or now - h > 10 * 60 or (s["since"] or 0) > h:   # on again since: old news
+        return ""
+    if now - h < WAKE_WAIT_SECS:
+        return f"Shut-down sent {span(now - h)} ago, waiting for it to go off."
+    return f"Still on {span(now - h)} after the shut-down."
+
+
+def state_html(s, now):
+    """The state line: a chip saying on or off, then for how long."""
+    text = describe(s, now)
+    if s["on"] is None:
+        return f'<span class="chip"><i></i>{text}</span>'
+    word = "On" if s["on"] else "Off"
+    return f'<span class="chip{" on" if s["on"] else ""}"><i></i>{word}</span>{html.escape(text[len(word):])}'
+
+
+def services_line(s):
+    if not s["on"] or not s.get("services"):
+        return ""
+    return "".join(f'<span class="{"ok" if up else "bad"}">{"✓" if up else "✗"} {html.escape(name)}</span>'
+                   for name, up in s["services"].items())
+
+
+def day(t):
+    return time.strftime("%-d %b %Y", time.gmtime(t))
+
+
+CSS = """
+:root { color-scheme: light dark; --bg: #f5f5f3; --card: #fff; --text: #1c1c1e; --muted: #6c6c70;
+  --line: #deded9; --on: #1e9e53; --off: #b3b3b8; --accent: #0a62d0; --warn: #a15c00;
+  --go: #1b7f46; --go-ink: #1b7f46; --stop: #c0392b; --stop-ink: #c0392b;
+  --on-bg: rgba(27, 127, 70, .12); --off-bg: rgba(60, 60, 67, .08); }
+@media (prefers-color-scheme: dark) { :root { --bg: #111113; --card: #1c1c1f; --text: #f2f2f4;
+  --muted: #9b9ba1; --line: #2e2e33; --on: #34c46e; --off: #5c5c62; --accent: #4c96ff; --warn: #f0a24a;
+  --go: #1e7a45; --go-ink: #4cc47f; --stop: #b83227; --stop-ink: #ef6b5d;
+  --on-bg: rgba(76, 196, 127, .16); --off-bg: rgba(235, 235, 245, .08); } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+main { max-width: 30rem; margin: 0 auto; padding: 28px 16px; }
+h1 { font-size: 1.3rem; margin: 0 0 18px; }
+a { color: var(--accent); }
+.card { display: flex; align-items: flex-start; gap: 14px; background: var(--card);
+  border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin-bottom: 12px; }
+.links { margin-top: 4px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 1px 9px 1px 7px; margin-right: 2px;
+  border-radius: 999px; background: var(--off-bg); color: var(--muted); font-size: .75rem; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; }
+.chip i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.chip.on { background: var(--on-bg); color: var(--go-ink); }
+.chip.on i { box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 30%, transparent); }
+.info { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.muted { color: var(--muted); font-size: .85rem; }
+.note, .err { color: var(--warn); }
+.note { font-size: .88rem; }
+.svcs { font-size: .88rem; display: flex; flex-wrap: wrap; gap: 2px 12px; }
+.ok { color: var(--on); }
+.bad { color: var(--warn); }
+button { font: inherit; font-weight: 600; padding: 9px 18px; border-radius: 10px; cursor: pointer;
+  border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+button.danger { background: var(--stop); border-color: var(--stop); }
+.actions { flex: none; width: 7.2rem; display: flex; flex-direction: column; gap: 6px; }
+.actions form { margin: 0; }
+.btn { display: block; width: 100%; padding: 8px 10px; border: 1px solid; border-radius: 10px; font: inherit;
+  font-weight: 600; text-align: center; text-decoration: none; cursor: pointer; }
+.btn.wake { background: var(--go); border-color: var(--go); color: #fff; }
+.btn.halt { background: var(--stop); border-color: var(--stop); color: #fff; }
+.btn.wake.second { background: transparent; color: var(--go-ink); }
+.btn.halt.second { background: transparent; color: var(--stop-ink); }
+.btn:disabled { background: transparent; border-color: var(--line); color: var(--muted); cursor: not-allowed; }
+.form label { display: block; margin-bottom: 12px; }
+.form label.choice { display: flex; gap: 8px; align-items: baseline; margin-bottom: 8px; }
+input:not([type=radio]) { display: block; font: inherit; width: 100%; padding: 11px 12px; margin-top: 4px;
+  border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
+fieldset { border: 1px solid var(--line); border-radius: 10px; margin: 0 0 12px; padding: 8px 12px 4px; }
+footer { color: var(--muted); font-size: .82rem; margin-top: 22px; }
+footer p { margin: 0 0 12px; }
+.btn.logout { display: inline-block; width: auto; padding: 8px 18px; background: transparent;
+  border-color: var(--line); color: var(--text); }
+"""
+
+
+def page(body, refresh=False):
+    meta = '<meta http-equiv="refresh" content="10">' if refresh else ""
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">{meta}
+<title>Wake</title><style>{CSS}</style></head>
+<body><main>{body}</main></body></html>
+""".encode()
+
+
+def error_line(error):
+    return f'<p class="err">{html.escape(error)}</p>' if error else ""
+
+
+def login_page(error=""):
+    return page(f"""<h1>Wake</h1>
+<form method="post" action="/login" class="form">
+<label>Password<input type="password" name="password" autocomplete="current-password" autofocus required></label>
+<button>Log in</button></form>{error_line(error)}
+<footer>New device? <a href="/ca.crt">Get the certificate</a> and trust it once, and the
+browser stops warning here and on the other home sites (README, HTTPS for the home sites).</footer>""")
+
+
+def main_page(machines, states, now, cert_until, error=""):
+    cards = []
+    for name, m in machines.items():
+        s = states.get(name) or new_state()
+        note, svcs = wake_note(s, now) or halt_note(s, now), services_line(s)
+        # the button for what makes sense now is filled, the other one outlined
+        wake = (f'<form method="post" action="/wake/{name}">'
+                f'<button class="btn wake{" second" if s["on"] else ""}">Wake</button></form>')
+        if m.get("shutdown"):
+            halt = f'<a class="btn halt{"" if s["on"] else " second"}" href="/shutdown/{name}">Shut down</a>'
+        else:       # not set up for this device: shown, but grey
+            halt = '<button class="btn halt" disabled title="Not set up for this device">Shut down</button>'
+        cards.append(f"""<section class="card">
+<div class="info"><div><b>{html.escape(m['label'])}</b></div>
+<div class="muted">{m['ip']}</div>
+<div class="state">{state_html(s, now)}</div>{f'<div class="note">{note}</div>' if note else ''}\
+{f'<div class="svcs">{svcs}</div>' if svcs else ''}
+<div class="links muted"><a href="/edit/{name}">Edit</a> · <a href="/remove/{name}">Remove</a></div></div>
+<div class="actions">{wake}{halt}</div>
+</section>""")
+    if not machines:
+        cards.append('<p class="muted">No devices on the list.</p>')
+    by_arp = [html.escape(m["label"]) for m in machines.values() if m["check"] == "arp"]
+    how = ""
+    if len(by_arp) == 1:
+        how = f" {by_arp[0]} goes by ARP, since it ignores ping."
+    elif by_arp:
+        how = f" {', '.join(by_arp[:-1])} and {by_arp[-1]} go by ARP, since they ignore ping."
+    cert = ""
+    if cert_until:
+        cert = f" Certificate valid until {day(cert_until)}."
+        if cert_until - now < 30 * 86400:
+            cards.append(f'<p class="note">The certificate runs out on {day(cert_until)}: '
+                         'make new ones (README, HTTPS for the home sites).</p>')
+    return page(f"""<h1>Wake</h1>
+{''.join(cards)}{error_line(error)}
+<p><a href="/add">+ Add a device</a></p>
+<footer><p>Checked from the laptop every {CHECK_SECS:g} s.{how}{cert}</p>
+<form method="post" action="/logout"><button class="btn logout">Log out</button></form></footer>""", refresh=True)
+
+
+def device_form(action, button, values, error):
+    v = {k: html.escape(values.get(k, "")) for k in ("label", "ip", "mac")}
+    arp = values.get("check") == "arp"
+    return f"""<form method="post" action="{action}" class="form">
+<label>Name<input name="label" value="{v['label']}" maxlength="40" required autocomplete="off"></label>
+<label>IP address<input name="ip" value="{v['ip']}" placeholder="192.168.50.23" inputmode="decimal" required
+ autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></label>
+<label>MAC address <span class="muted">(leave it empty and the page looks it up, if the device is on now)</span>
+<input name="mac" value="{v['mac']}" placeholder="02:00:00:00:00:20" autocomplete="off" autocorrect="off"
+ autocapitalize="characters" spellcheck="false"></label>
+<fieldset><legend>How the page tells it is on</legend>
+<label class="choice"><input type="radio" name="check" value="ping"{'' if arp else ' checked'}>
+ Ping: most devices</label>
+<label class="choice"><input type="radio" name="check" value="arp"{' checked' if arp else ''}>
+ ARP: a device that ignores ping, like a Windows PC</label></fieldset>{error_line(error)}
+<p><button>{button}</button> &nbsp; <a href="/">Cancel</a></p></form>"""
+
+
+def add_page(values=None, error=""):
+    return page(f"""<h1>Add a device</h1>
+{device_form("/add", "Add", values or {}, error)}
+<footer>For a wake-up to work, Wake-on-LAN has to be on in the device's BIOS and network settings. Give it a
+fixed IP address (a reservation in the router), since the page checks it at that address.</footer>""")
+
+
+def edit_page(name, m, values=None, error=""):
+    sites = " and ".join(html.escape(s) for s in (m.get("services") or {}))
+    keep = f"\n<footer>Its checks of {sites} stay, and move along if the IP address changes.</footer>" if sites else ""
+    return page(f"""<h1>Edit {html.escape(m['label'])}</h1>
+{device_form(f"/edit/{name}", "Save", values or m, error)}{keep}""")
+
+
+def remove_page(name, m):
+    sites = " and ".join(html.escape(s) for s in (m.get("services") or {}))
+    also = f" Its checks of {sites} go with it, and adding it again does not bring those back." if sites else ""
+    return page(f"""<h1>Remove {html.escape(m['label'])}?</h1>
+<p>It goes off this list; nothing happens to the device itself, and adding it again brings it back.{also}</p>
+<form method="post" action="/remove/{name}"><p><button class="danger">Remove</button> &nbsp;
+<a href="/">Cancel</a></p></form>""")
+
+
+def shutdown_page(name, m, on=None):
+    if on is False:
+        return page(f"""<h1>{html.escape(m['label'])} is off</h1>
+<p>The page sees it as off already, so there is nothing to shut down.</p>
+<p><a href="/">Back</a></p>""")
+    return page(f"""<h1>Shut down {html.escape(m['label'])}?</h1>
+<p>It switches off the way its own shutdown does, so anything unsaved on it is lost. The Wake button brings it
+back.</p>
+<form method="post" action="/shutdown/{name}"><p><button class="danger">Shut down</button> &nbsp;
+<a href="/">Cancel</a></p></form>""")
+
+
+# --- the login -------------------------------------------------------------
+
+def hash_password(password, salt=None):
+    salt = salt or os.urandom(16)
+    return f"scrypt${salt.hex()}${hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1).hex()}"
+
+
+def password_ok(password, stored):
+    kind, _, rest = stored.partition("$")
+    salt, _, want = rest.partition("$")
+    try:
+        got = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=2**14, r=8, p=1).hex()
+    except ValueError:
+        return False
+    return kind == "scrypt" and hmac.compare_digest(got.encode(), want.encode())
+
+
+def read_password():
+    try:
+        return (DIR / "password").read_text().strip()
+    except OSError:
+        return ""
+
+
+def signature(secret, stored, expires):
+    # Signed over the password hash too, so a new password logs every device out.
+    return hmac.new(secret, f"{expires}${stored}".encode(), hashlib.sha256).hexdigest()
+
+
+def make_cookie(secret, stored, now):
+    expires = int(now) + SESSION_DAYS * 86400
+    return f"{expires}.{signature(secret, stored, expires)}"
+
+
+def cookie_ok(value, secret, stored, now):
+    expires, _, sig = value.partition(".")
+    if not re.fullmatch(r"[0-9]{1,12}", expires) or int(expires) <= now:
+        return False
+    return hmac.compare_digest(sig.encode(), signature(secret, stored, int(expires)).encode())
+
+
+def load_secret():
+    try:
+        return bytes.fromhex((DIR / "secret").read_text().strip())
+    except (OSError, ValueError):
+        secret = os.urandom(32)
+        write_private(DIR / "secret", secret.hex() + "\n")
+        return secret
+
+
+# --- the server ------------------------------------------------------------
+
+COOKIE = "session={}; Max-Age={}; Path=/; Secure; HttpOnly; SameSite=Lax"
+CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "wake-page"
+    sys_version = ""
+    timeout = 30
+
+    def log_message(self, *args):
+        pass        # the page reloads every 10 s; changes and wrong passwords are logged below
+
+    def send(self, status, body=b"", ctype="text/html; charset=utf-8", headers=()):
+        self.send_response(status)
+        for k, v in [("Content-Type", ctype), ("Content-Length", str(len(body))),
+                     ("Cache-Control", "no-store"), ("Content-Security-Policy", CSP), *headers]:
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def redirect(self, where, headers=()):
+        self.send(HTTPStatus.SEE_OTHER, headers=[("Location", where), *headers])
+
+    def not_found(self):
+        self.send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
+
+    def from_this_page(self):
+        """Whether a form post comes from this page itself. Browsers count every
+        port of the laptop as one site, so the cookie's SameSite does not keep
+        the laptop's other pages (Pi-hole, MeTube, the camera page) from posting
+        here; the Origin header, which no page can set, does. A client that
+        sends neither Origin nor Referer is no browser, and still needs the login."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            referer = self.headers.get("Referer")
+            if referer is None:
+                return True
+            parts = urllib.parse.urlsplit(referer)
+            origin = f"{parts.scheme}://{parts.netloc}"
+        return origin.lower() == f"https://{self.headers.get('Host', '')}".lower()
+
+    def logged_in(self):
+        try:
+            morsel = SimpleCookie(self.headers.get("Cookie", "")).get("session")
+        except CookieError:
+            return False
+        stored = read_password()
+        return bool(morsel and stored) and cookie_ok(morsel.value, self.server.secret, stored, time.time())
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/ca.crt":         # public by nature, and a new device needs it before logging in
+            return self.send(HTTPStatus.OK, CA.read_bytes(), "application/x-x509-ca-cert")
+        if path == "/login":
+            return self.send(HTTPStatus.OK, login_page())
+        if not self.logged_in():
+            return self.redirect("/login")
+        if path == "/":
+            return self.send(HTTPStatus.OK, self.server.main_page())
+        if path == "/add":
+            return self.send(HTTPStatus.OK, add_page())
+        if path.startswith("/shutdown/"):
+            name = path.removeprefix("/shutdown/")
+            m = self.server.watcher.machine(name)
+            if not m or not m.get("shutdown"):
+                return self.not_found()
+            on = self.server.watcher.snapshot()[1].get(name, {}).get("on")
+            return self.send(HTTPStatus.OK, shutdown_page(name, m, on))
+        for prefix, page_for in (("/edit/", edit_page), ("/remove/", remove_page)):
+            if path.startswith(prefix):
+                name = path.removeprefix(prefix)
+                m = self.server.watcher.machine(name)
+                return self.send(HTTPStatus.OK, page_for(name, m)) if m else self.not_found()
+        self.not_found()
+
+    do_HEAD = do_GET
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= 4096:
+            return self.send(HTTPStatus.BAD_REQUEST, b"Bad request\n", "text/plain; charset=utf-8")
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+        if not self.from_this_page():
+            log(f"refused a form from another page ({self.headers.get('Origin') or self.headers.get('Referer')}), "
+                f"from {self.client_address[0]}")
+            return self.send(HTTPStatus.FORBIDDEN, b"Forms are only taken from this page\n", "text/plain; charset=utf-8")
+        if path == "/login":
+            return self.login(form.get("password", [""])[0])
+        if not self.logged_in():
+            return self.redirect("/login")
+        who = self.client_address[0]
+        if path == "/logout":
+            return self.redirect("/login", [("Set-Cookie", COOKIE.format("", 0))])
+        if path == "/add":
+            fields = {k: form.get(k, [""])[0] for k in ("label", "ip", "mac", "check")}
+            try:
+                _, m = self.server.watcher.add(**fields)
+            except ValueError as e:
+                return self.send(HTTPStatus.BAD_REQUEST, add_page(fields, str(e)))
+            except OSError as e:
+                return self.send(HTTPStatus.INTERNAL_SERVER_ERROR, add_page(fields, f"Could not save the list: {e}"))
+            log(f"added {m['label']} ({m['ip']}, {m['mac']}, by {m['check']}), from {who}")
+            return self.redirect("/")
+        if path.startswith("/edit/"):
+            name = path.removeprefix("/edit/")
+            fields = {k: form.get(k, [""])[0] for k in ("label", "ip", "mac", "check")}
+            try:
+                old, new = self.server.watcher.edit(name, **fields)
+            except LookupError:
+                return self.not_found()
+            except ValueError as e:
+                m = self.server.watcher.machine(name) or {"label": fields["label"]}
+                return self.send(HTTPStatus.BAD_REQUEST, edit_page(name, m, fields, str(e)))
+            except OSError as e:
+                m = self.server.watcher.machine(name) or {"label": fields["label"]}
+                return self.send(HTTPStatus.INTERNAL_SERVER_ERROR,
+                                 edit_page(name, m, fields, f"Could not save the list: {e}"))
+            changes = ", ".join(f"{k} {old[k]} -> {new[k]}" for k in ("label", "ip", "mac", "check")
+                                if old[k] != new[k])
+            log(f"edited {old['label']}: {changes or 'nothing changed'}, from {who}")
+            return self.redirect("/")
+        if path.startswith("/remove/"):
+            try:
+                m = self.server.watcher.remove(path.removeprefix("/remove/"))
+            except OSError as e:
+                return self.send(HTTPStatus.INTERNAL_SERVER_ERROR, self.server.main_page(f"Could not save the list: {e}"))
+            if m is None:
+                return self.not_found()
+            log(f"removed {m['label']} ({m['ip']}, {m['mac']}), from {who}")
+            return self.redirect("/")
+        if path.startswith("/shutdown/"):
+            name = path.removeprefix("/shutdown/")
+            m = self.server.watcher.machine(name)
+            if not m or not m.get("shutdown"):
+                return self.not_found()
+            problem = shut_down(m["shutdown"], m["ip"])
+            if problem is None:
+                self.server.watcher.halted(name)
+                log(f"shut-down sent to {m['label']}, from {who}")
+                return self.redirect("/")
+            log(f"could not shut down {m['label']}: {problem}")
+            return self.send(HTTPStatus.INTERNAL_SERVER_ERROR,
+                             self.server.main_page(f"Could not shut down {m['label']}: {problem}"))
+        name = path.removeprefix("/wake/")
+        m = self.server.watcher.machine(name) if path.startswith("/wake/") else None
+        if not m:
+            return self.not_found()
+        if wake(m["mac"]):
+            self.server.watcher.woke(name)
+            log(f"wake-up sent to {m['label']}, from {who}")
+            return self.redirect("/")
+        log(f"could not send the wake-up to {m['label']}")
+        self.send(HTTPStatus.INTERNAL_SERVER_ERROR, self.server.main_page(f"Could not send the wake-up to {m['label']}."))
+
+    def login(self, password):
+        stored = read_password()
+        with self.server.login_lock:           # one try at a time, and a wrong one costs a second
+            ok = bool(stored) and password_ok(password, stored)
+            if not ok:
+                time.sleep(1)
+        if not ok:
+            log(f"wrong password from {self.client_address[0]}")
+            return self.send(HTTPStatus.FORBIDDEN, login_page("Wrong password."))
+        cookie = make_cookie(self.server.secret, stored, time.time())
+        self.redirect("/", [("Set-Cookie", COOKIE.format(cookie, SESSION_DAYS * 86400))])
+
+
+class Server(ThreadingHTTPServer):
+    def __init__(self, addr, tls, watcher, secret, cert_until):
+        super().__init__(addr, Handler)
+        self.tls, self.watcher, self.secret, self.cert_until = tls, watcher, secret, cert_until
+        self.login_lock = threading.Lock()
+
+    def finish_request(self, request, client_address):
+        # The TLS handshake runs here, in the connection's own thread, so a slow
+        # or refusing client cannot hold up the others.
+        request.settimeout(30)
+        try:
+            conn = self.tls.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return      # plain http://, or a browser that does not trust the certificate yet
+        try:
+            self.RequestHandlerClass(conn, client_address, self)
+        finally:
+            conn.close()
+
+    def handle_error(self, request, client_address):
+        log(f"request from {client_address[0]} failed: {sys.exc_info()[1]!r}")
+
+    def main_page(self, error=""):
+        return main_page(*self.watcher.snapshot(), time.time(), self.cert_until, error)
+
+
+def cert_expiry():
+    try:
+        out = subprocess.run(["openssl", "x509", "-noout", "-enddate", "-in", str(CERT)],
+                             capture_output=True, text=True, timeout=10).stdout
+        return ssl.cert_time_to_seconds(out.strip().partition("=")[2])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def serve():
+    missing = [str(f) for f in (CERT, KEY, CA, DIR / "password") if not f.is_file()]
+    if missing:
+        log(f"missing: {', '.join(missing)}; see README, The wake page")
+        sys.exit(2)     # wake-page.service does not restart on 2: waiting will not fix this
+    try:
+        watcher = Watcher(DIR)
+    except (OSError, ValueError) as e:
+        log(f"cannot read the devices: {e}. Fix machines.json, or move it away to start from the defaults.")
+        sys.exit(2)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.minimum_version = ssl.TLSVersion.TLSv1_2
+    tls.load_cert_chain(CERT, KEY)
+    server = Server((BIND, PORT), tls, watcher, load_secret(), cert_expiry())
+    watcher.start()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    log(f"listening on https://{BIND}:{PORT}")
+    try:
+        server.serve_forever()
+    finally:
+        watcher.save()
+
+
+# --- setting it up ---------------------------------------------------------
+
+def set_password():
+    DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if sys.stdin.isatty():
+        password = getpass.getpass("New password for the wake page: ")
+        if getpass.getpass("Once more: ") != password:
+            sys.exit("The two did not match; nothing changed.")
+    else:
+        password = sys.stdin.readline().rstrip("\n")       # for scripts and the tests
+    if len(password) < 8:
+        sys.exit("Use at least 8 characters; nothing changed.")
+    write_private(DIR / "password", hash_password(password) + "\n")
+    print("Password set. Devices that were logged in have to log in again.")
+
+
+def main():
+    p = argparse.ArgumentParser(description="The wake page; see README, The wake page.")
+    p.add_argument("--set-password", action="store_true", help="ask for the password; only a hash is kept")
+    if p.parse_args().set_password:
+        set_password()
+    else:
+        serve()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+# /etc/sudoers.d/backup-logins - the only root the two backup logins get, and
+# only through rrsync, which checks every rsync option and path against its
+# mode (-ro read-only, -wo write-only) and its directory: each tree on its own,
+# so neither login can reach anything else as root. Their forced command,
+# backup-gate, is what calls these. rrsync reads the request from
+# SSH_ORIGINAL_COMMAND, so sudo has to let that variable through.
+# Versioned in host-maintenance (backup-logins/).
+Defaults:backup-server,desktop env_keep += "SSH_ORIGINAL_COMMAND"
+backup-server ALL=(root) NOPASSWD: /usr/bin/rrsync -ro /mnt/dietpi-backup/data, /usr/bin/rrsync -ro /mnt/dietpi-desktop-backup, /usr/bin/rrsync -ro /mnt/dietpi-desktop-nextcloud-backup
+desktop ALL=(root) NOPASSWD: /usr/bin/rrsync -wo /mnt/dietpi-desktop-backup, /usr/bin/rrsync -wo /mnt/dietpi-desktop-nextcloud-backup

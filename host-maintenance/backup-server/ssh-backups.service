@@ -1,0 +1,8 @@
+[Unit]
+Description=Run SSH Backups of other server destinations and initate shutdown if system is inactive
+After=network.target time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ssh-backups-cycle.sh
+TimeoutStartSec=0

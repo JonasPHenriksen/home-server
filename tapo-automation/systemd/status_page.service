@@ -1,0 +1,18 @@
+[Unit]
+Description=Camera status page (timeline, playback and download of recordings)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dietpi
+WorkingDirectory=/home/dietpi/tapo-automation
+ExecStart=/home/dietpi/tapo-automation/tapo-env/bin/python3 /home/dietpi/tapo-automation/status_page.py
+Restart=always
+RestartSec=5
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+# /home/backup-server/.ssh/authorized_keys on the laptop, owned by root.
+# The backup server's root logs in as `backup-server` with its own key. The key can do only what
+# `backup-gate pull` allows, and the gate accepts it only from the backup
+# server, 192.168.50.30 (dropbear has no from=).
+restrict,command="/usr/local/bin/backup-gate pull" ssh-ed25519 AAAA...example-public-key... backup-server root to laptop

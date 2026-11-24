@@ -1,0 +1,58 @@
+#!/bin/bash
+#
+# backup-logins/finish - take the old way out, once the backup server and the
+# desktop have both switched to their own logins and each passed a real run
+# (README, "Backup logins"). Run it as root, from the repo:
+#
+#   sudo ~/host-maintenance/backup-logins/finish
+#
+# After it, dietpi has no way to root without the password: no passwordless
+# `sudo rsync`, and no docker group.
+set -eu
+
+LOGS="${LOGS:-/mnt/dietpi_userdata/logs}"
+KEYS="${KEYS:-/home/dietpi/.ssh/authorized_keys}"
+DESKTOP_KEY="AAAA...example-public-key..."   # SHA256:example
+
+[ "$(id -u)" = 0 ] || { echo "backup-logins/finish: run it with sudo" >&2; exit 1; }
+say() { echo "backup-logins: $*"; }
+
+# 1. dietpi's passwordless rsync, which the two machines used to log in through.
+rm -f /etc/sudoers.d/dietpi-rsync
+visudo -c >/dev/null
+say "dietpi's passwordless rsync removed"
+
+# 2. The desktop's key comes off dietpi's login (it lives on as `desktop`).
+#    Only that one line goes; a copy of the file is kept next to it.
+if grep -q "$DESKTOP_KEY" "$KEYS"; then
+    cp -p "$KEYS" "$KEYS.before-backup-logins"
+    grep -v "$DESKTOP_KEY" "$KEYS.before-backup-logins" > "$KEYS.new"
+    [ -s "$KEYS.new" ] || { rm -f "$KEYS.new"; echo "backup-logins: refusing to leave dietpi without keys" >&2; exit 1; }
+    chown dietpi:dietpi "$KEYS.new" && chmod 600 "$KEYS.new" && mv -f "$KEYS.new" "$KEYS"
+    say "the desktop's key removed from dietpi's login ($(grep -c '^ssh-\|^[a-z].* ssh-' "$KEYS") key(s) left)"
+fi
+
+# 3. Only its own machine writes into each report folder now.
+chown -R backup-server:backup-server "$LOGS/backup-server" && chmod 755 "$LOGS/backup-server"
+chown -R desktop:desktop "$LOGS/desktop" && chmod 755 "$LOGS/desktop"
+rm -f "$LOGS/.backup-heartbeat"
+say "report folders closed to dietpi, the old heartbeat removed"
+
+# 4. dietpi leaves the docker group: docker is root by another name. Docker
+#    commands need sudo from now on (effective at the next login).
+if id -nG dietpi | grep -qw docker; then
+    gpasswd -d dietpi docker >/dev/null
+    say "dietpi removed from the docker group"
+fi
+
+say "what dietpi may still run as root:"
+sudo -l -U dietpi | sed -n '/may run/,$p'
+
+# The grant can sit in more than one file (on the laptop it was also in
+# /etc/sudoers itself), so check the result rather than trust the removal.
+if sudo -l -U dietpi | grep -q 'NOPASSWD:.*rsync'; then
+    echo "backup-logins: dietpi can STILL run rsync as root without a password:" >&2
+    grep -rn 'NOPASSWD.*rsync' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -v backup-logins >&2
+    echo "backup-logins: remove that line with visudo (README, Backup logins)" >&2
+    exit 1
+fi

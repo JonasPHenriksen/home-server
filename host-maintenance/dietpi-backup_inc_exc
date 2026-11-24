@@ -1,0 +1,26 @@
+# DietPi-Backup include/exclude filter
+
+# Prefix "-" exclude items, "+" include items which would match a wildcard exclude rule.
+# Suffix "/" match directories only, no files or symlinks.
+# Wildcard "*" matches any item name or part of it, but "/dir/*" does not match the dir itself.
+# Since the list is processed from top to bottom and the first match defines the applied rule:
+# - Includes need to be defined before their wildcard exclude rule.
+# - Excludes need to be defined before their wildcard include rule.
+# Symlinks are handled as such and never processed recursively.
+# Excluded directories are not processed recursively, so contained items cannot be included.
+# Included directories are not processed recursively, so contained items cannot be excluded.
+# Hence, to include items within an excluded directory:
+# - Do not exclude the directory itself, but contained items via wildcard.
+# - Define includes first, to override the wildcard exclude rule.
+# - See the below default rules, how we exclude all items below /mnt/
+#   but include the dietpi_userdata directory, if it is no symlink.
+# To prevent loops, the backup target dir, log and config are excluded internally.
+
++ /mnt/dietpi_userdata/
+- /mnt/*
+- /media/*
+- /home/dietpi/tapo-automation/recordings/*
+- /home/dietpi/tapo-automation/logs/*
+- /home/dietpi/tapo-automation/bin/*
+- /var/lib/containerd/*
+- /var/spool/ntfy-notify/*

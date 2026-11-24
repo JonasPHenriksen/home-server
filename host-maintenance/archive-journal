@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+# archive-journal - keep the systemd journal past a reboot or a power cut.
+# Installed as /usr/local/bin/archive-journal, run every 15 minutes by
+# archive-journal.timer and once more on the way down by
+# archive-journal-shutdown.service. Versioned in the host-maintenance repo.
+#
+# The journal on this machine is volatile. /var/log is a 50 MB tmpfs (DietPi
+# RAMlog) and there is no /var/log/journal, so journald falls back to
+# /run/log/journal and the whole journal dies with the machine. The weekly job
+# reboots every Sunday, and a power cut or a freeze is a hard
+# stop - which is precisely when you want to read what the machine was doing.
+#
+# The textbook fix, a persistent /var/log/journal, is actively unsafe here:
+# DietPi's hourly dietpi-logclear runs `find /var/log -type f` and truncates or
+# deletes everything it finds, and journal files would be found. Rather than
+# fight RAMlog, this copies new entries out to the data disk, next to the other
+# logs that are already kept.
+#
+# journalctl's own cursor file makes that incremental: each run resumes exactly
+# where the last one stopped, so nothing is copied twice and nothing is missed
+# across a reboot. Between runs up to 15 minutes of journal is still only in
+# RAM; the shutdown unit closes that window for a clean reboot, and a power cut
+# is the one case where some loss is unavoidable.
+#
+#   archive-journal             archive new entries (used by the timer)
+#   archive-journal --status    print what has been archived, write nothing
+#
+# Output:
+#   $ARCHIVE_DIR/journal-YYYY-MM-DD.log  one file per day, kept $RETAIN_DAYS days
+#   $ARCHIVE_DIR/.cursor                 where the last run stopped
+#
+# Environment (the tests point these at a temp dir and a fake journalctl):
+#   ARCHIVE_DIR   where the copies go
+#   CURSOR        the cursor file
+#   RETAIN_DAYS   how long a daily file is kept
+#   JOURNALCTL    journalctl binary
+#
+set -u
+
+ARCHIVE_DIR="${ARCHIVE_DIR:-/mnt/dietpi_userdata/logs/journal}"
+CURSOR="${CURSOR:-$ARCHIVE_DIR/.cursor}"
+RETAIN_DAYS="${RETAIN_DAYS:-30}"
+JOURNALCTL="${JOURNALCTL:-/usr/bin/journalctl}"
+
+if [ "${1:-}" = "--status" ]; then
+    if [ -d "$ARCHIVE_DIR" ]; then
+        echo "archive: $ARCHIVE_DIR"
+        echo "kept: $(find "$ARCHIVE_DIR" -maxdepth 1 -name 'journal-*.log' 2>/dev/null | wc -l) day file(s), $(du -sh "$ARCHIVE_DIR" 2>/dev/null | cut -f1)"
+        if [ -s "$CURSOR" ]; then
+            echo "cursor: written $(date -u -r "$CURSOR" '+%Y-%m-%d %H:%M:%S') UTC"
+        else
+            echo "cursor: none yet, the next run copies the whole journal"
+        fi
+        find "$ARCHIVE_DIR" -maxdepth 1 -name 'journal-*.log' -printf '  %f  %s bytes\n' 2>/dev/null | sort
+    else
+        echo "no archive yet at $ARCHIVE_DIR"
+    fi
+    exit 0
+fi
+
+[ "${1:-}" = "" ] || { echo "archive-journal: unknown argument: $1 (try --status)" >&2; exit 1; }
+
+mkdir -p "$ARCHIVE_DIR" || { echo "archive-journal: cannot create $ARCHIVE_DIR" >&2; exit 1; }
+
+out="$ARCHIVE_DIR/journal-$(date -u '+%Y-%m-%d').log"
+tmp="$(mktemp "${TMPDIR:-/tmp}/archive-journal.XXXXXX")" || exit 1
+trap 'rm -f "$tmp"' EXIT
+
+# --cursor-file both reads where we stopped and writes where we stopped now.
+# On the first run the file does not exist, so this takes the journal entire.
+if ! "$JOURNALCTL" --cursor-file="$CURSOR" --no-pager --quiet > "$tmp" 2>/dev/null; then
+    echo "archive-journal: journalctl failed" >&2
+    exit 1
+fi
+
+# A quiet quarter of an hour is the normal case: say nothing and leave no
+# empty file behind.
+if [ -s "$tmp" ]; then
+    cat "$tmp" >> "$out" || exit 1
+    echo "archive-journal: $(wc -l < "$tmp") line(s) appended to $(basename "$out")"
+fi
+
+# Prune whole days, never the file being written to today.
+find "$ARCHIVE_DIR" -maxdepth 1 -name 'journal-*.log' -mtime "+$RETAIN_DAYS" -delete 2>/dev/null
+
+exit 0

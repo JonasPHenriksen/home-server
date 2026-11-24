@@ -1,0 +1,24 @@
+// Security fixes only, applied every day by /etc/cron.daily/security-upgrades
+// (host-maintenance repo). Everything else - point releases, Docker, Tailscale,
+// DietPi - waits for the Sunday job, which also reboots when a kernel came in.
+//
+// Installed as /etc/apt/apt.conf.d/52unattended-upgrades-security-only. The
+// "52" sorts after the package's 50unattended-upgrades, and #clear drops the
+// origins it defines (which include ordinary stable updates).
+
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+};
+
+// The weekly job owns reboots and cleanup; the daily run only installs fixes.
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
+Unattended-Upgrade::InstallOnShutdown "false";
+
+// One package at a time, so a stop mid-run leaves a consistent system.
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::SyslogEnable "true";

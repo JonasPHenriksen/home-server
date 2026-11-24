@@ -1,0 +1,14 @@
+[Unit]
+Description=Run DietPi Backup 2 minutes after boot, and Saturday 23:00 if the desktop is up
+
+[Timer]
+# Saturday night, so the backup server's Sunday run (after the laptop's 03:30 job)
+# pulls a fresh copy. The boot trigger catches up when the desktop was off then;
+# the script itself makes sure it runs once per Saturday-to-Saturday week.
+OnBootSec=2min
+OnCalendar=Sat *-*-* 23:00:00
+Persistent=true
+Unit=dietpi-boot-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,21 @@
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets: camera login and RTSP URLs. Never commit these.
+.tapo_credentials
+config.json
+
+# Runtime state written by the scripts
+.tapo_*
+*.log
+logs/
+
+# Recordings written by cam_recorder.py
+recordings/
+
+# Local tooling
+tapo-env/
+bin/
+frigate/

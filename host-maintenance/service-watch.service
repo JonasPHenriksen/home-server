@@ -1,0 +1,9 @@
+[Unit]
+Description=Push a notification when a service, DNS, Tailscale, a container or the disk breaks
+Documentation=file:///home/dietpi/host-maintenance/README.md
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/service-watch
+Nice=10

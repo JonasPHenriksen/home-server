@@ -1,0 +1,10 @@
+[Unit]
+Description=Run machine-reports every five minutes
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

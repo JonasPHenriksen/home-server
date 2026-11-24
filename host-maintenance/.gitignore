@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+
+# ntfy publish token. Never commit this; see ntfy/ntfy-notify.conf.example.
+ntfy/ntfy-notify.conf
+
+# Local tooling: the test virtualenv (see README, Running the tests).
+maint-env/

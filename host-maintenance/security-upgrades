@@ -1,0 +1,143 @@
+#!/bin/bash
+#
+# Daily security updates. Installed as /etc/cron.daily/security-upgrades, which
+# cron runs at 02:10 (host time). Versioned in the
+# host-maintenance repo (~/host-maintenance).
+#
+# Debian security fixes used to wait for the Sunday job, up to a week. This
+# runs unattended-upgrade every day with only the security origins (see
+# apt/52unattended-upgrades-security-only); point releases, Docker, Tailscale
+# and DietPi still wait for the weekly job, which also reboots when a kernel
+# came in. DietPi masks the apt-daily timers on purpose, so this is driven
+# from cron.daily instead of fighting that. Sundays are skipped: the weekly
+# job at 03:30 upgrades everything anyway, and the two must not overlap.
+#
+# Output:
+#   $LOG_DIR/security-upgrades.log       one line per run, kept
+#   $LOG_DIR/security-upgrades-last.log  full unattended-upgrade output of the last run
+#
+# One push notification (ntfy-notify) when something was installed or went
+# wrong; nothing when there was nothing to do. It says "Security patch" and
+# carries a lock, never the weekly job's check mark: when the two shared it, a
+# Saturday security fix was taken for the weekly maintenance running early.
+#
+# Environment:
+#   DRY_RUN=1    print the commands instead of running them, log to stdout
+#   LOG_DIR      override the log directory
+#   NOTIFY       path of the ntfy-notify helper (default /usr/local/bin/ntfy-notify)
+#   WEEKDAY      1-7 (Monday-Sunday) to use instead of today's (tests)
+
+set -u
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+export DEBIAN_FRONTEND=noninteractive
+
+DRY_RUN="${DRY_RUN:-0}"
+LOG_DIR="${LOG_DIR:-/mnt/dietpi_userdata/logs}"
+NOTIFY="${NOTIFY:-/usr/local/bin/ntfy-notify}"
+WEEKDAY="${WEEKDAY:-$(date -u +%u)}"
+APT_UPDATE_TRIES=3
+APT_UPDATE_WAIT=30
+UNATTENDED=/usr/bin/unattended-upgrade
+
+# --------------------------------------------------------------------------- helpers
+
+run() {
+    if [ "$DRY_RUN" = 1 ]; then echo "DRY: $*"; else "$@"; fi
+}
+
+# One line per run, kept.
+status_line() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "STATUS: $*"
+    else
+        echo "$(date -u '+%Y-%m-%d %H:%M') $*" >> "$LOG_DIR/security-upgrades.log"
+    fi
+}
+
+# Push one notification: notify PRIORITY TAGS TITLE [MESSAGE]. Optional.
+notify() {
+    local priority="$1" tags="$2" title="$3"; shift 3
+    if [ "$DRY_RUN" != 1 ] && [ ! -x "$NOTIFY" ]; then
+        echo "note: $NOTIFY not installed, no notification sent ($title)"
+        return 0
+    fi
+    run "$NOTIFY" -p "$priority" -t "$tags" "$title" "$@" || echo "note: notification failed ($title)"
+}
+
+# A single mirror hiccup must not cost the day's fixes; stale lists still work.
+apt_update() {
+    local try
+    for try in $(seq 1 "$APT_UPDATE_TRIES"); do
+        run /usr/bin/apt-get update -q && return 0
+        [ "$try" -lt "$APT_UPDATE_TRIES" ] && [ "$APT_UPDATE_WAIT" -gt 0 ] && sleep "$APT_UPDATE_WAIT"
+    done
+    echo "WARNING: apt-get update failed $APT_UPDATE_TRIES times, running with the lists we have"
+    return 1
+}
+
+# Turn unattended-upgrade's output and exit code into a status line and a push.
+# report OUTPUT RC
+report() {
+    local out="$1" rc="$2" pkgs reboot=""
+    pkgs=$(grep -m1 '^Packages that will be upgraded:' <<< "$out" | cut -d: -f2- | xargs)
+    [ -f /var/run/reboot-required ] && reboot=" (reboot pending, the Sunday job does it)"
+    if [ "$rc" -ne 0 ]; then
+        status_line "WARNING: unattended-upgrade failed (rc=$rc)${pkgs:+, wanted: $pkgs}"
+        notify high warning "Security patch failed" "unattended-upgrade rc=$rc${pkgs:+, wanted: $pkgs}. See security-upgrades-last.log."
+        return 1
+    fi
+    if [ -n "$pkgs" ]; then
+        status_line "installed: $pkgs$reboot"
+        notify low lock "Security patch installed" "$pkgs$reboot"
+    else
+        status_line "nothing to do"
+    fi
+}
+
+# --------------------------------------------------------------------------- main
+
+main() {
+    if [ "$WEEKDAY" = 7 ]; then
+        status_line "skipped: Sunday, the weekly job upgrades everything"
+        return 0
+    fi
+    if [ "$DRY_RUN" != 1 ] && [ ! -x "$UNATTENDED" ]; then
+        status_line "skipped: unattended-upgrades is not installed"
+        return 1
+    fi
+    # Never run over the weekly job (it holds this lock for its whole run).
+    if [ "$DRY_RUN" != 1 ]; then
+        exec 8>"$LOG_DIR/.maintenance.lock"
+        if ! flock -n 8; then
+            status_line "skipped: the weekly maintenance is running"
+            return 0
+        fi
+    fi
+
+    echo "=== Security updates started at $(date) ==="
+    apt_update
+    local out rc
+    if [ "$DRY_RUN" = 1 ]; then
+        out=$(run "$UNATTENDED" -v); rc=0
+        echo "$out"
+    else
+        out=$("$UNATTENDED" -v 2>&1); rc=$?
+        printf '%s\n' "$out" > "$LOG_DIR/security-upgrades-last.log"
+    fi
+    report "$out" "$rc"
+}
+
+# Sourcing the script defines the helpers without running anything (tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    mkdir -p "$LOG_DIR"
+    if [ "$DRY_RUN" = 1 ]; then
+        main
+    else
+        main >> "$LOG_DIR/security-upgrades-last.log.tmp" 2>&1
+        rc=$?
+        # the tmp file holds our own lines (apt update, notes); keep them after the u-u output
+        [ -f "$LOG_DIR/security-upgrades-last.log.tmp" ] && cat "$LOG_DIR/security-upgrades-last.log.tmp" >> "$LOG_DIR/security-upgrades-last.log" 2>/dev/null
+        rm -f "$LOG_DIR/security-upgrades-last.log.tmp"
+        exit "$rc"
+    fi
+fi

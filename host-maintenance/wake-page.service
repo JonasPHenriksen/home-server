@@ -1,0 +1,17 @@
+[Unit]
+Description=Wake page: HTTPS page behind a password that shows whether the desktop and the PC are on, and wakes them
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dietpi
+ExecStart=/usr/bin/python3 /home/dietpi/host-maintenance/wake-page
+Restart=always
+RestartSec=5
+# 2 = the certificate or the password is missing: restarting will not fix that
+RestartPreventExitStatus=2
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

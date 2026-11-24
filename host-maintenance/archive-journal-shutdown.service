@@ -1,0 +1,23 @@
+[Unit]
+Description=Copy the last journal entries to disk before shutdown
+Documentation=file:/home/dietpi/host-maintenance/README.md
+# The journal lives in /run and is gone once this machine stops, so the copy
+# has to happen while the filesystems are still up. RemainAfterExit plus a
+# do-nothing ExecStart makes this unit a pure shutdown hook: it does its work
+# in ExecStop, on the way down. The weekly job reboots every Sunday, which is
+# the reboot this is here for.
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/archive-journal
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

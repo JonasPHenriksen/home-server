@@ -1,0 +1,455 @@
+#!/bin/bash
+#
+# Weekly host maintenance. Installed as /etc/cron.weekly/system-and-pihole-updater,
+# which cron runs on Sundays at 03:30 (host time).
+# Versioned in the host-maintenance repo (~/host-maintenance).
+#
+#   1. DietPi backup, then arrange for the backup server (192.168.50.30) to be
+#      woken: after the reboot at the end if wake-backup-server.service is
+#      installed (so it can never catch this machine mid-reboot), else right away
+#   2. disk health: SMART status and key attributes, then a short self-test
+#   3. DietPi and APT updates
+#   4. cleanup: purge old kernels (keeping the running and the newest one),
+#      autoremove --purge, clean the package cache
+#   5. Pi-hole update and gravity refresh
+#   6. container images: pull every Compose project, recreate what changed
+#   7. the result: failed steps pushed at once; the weekly push itself goes out
+#      from machine-reports once the backup server has reported (from here when
+#      machine-reports is not installed), then reboot
+#
+# A failing step is logged and counted, and the run continues: the backup is
+# already taken by then, and skipping the reboot after a kernel upgrade would be
+# worse than a noisy log. The exit code is non-zero when anything failed.
+#
+# Output:
+#   $LOG_DIR/weekly-updater.log      full log of the last run (overwritten)
+#   $LOG_DIR/maintenance-status.log  one line per run, kept: finished or aborted
+#   $LOG_DIR/disk-health.log         one line per run, kept, to see trends
+#   $LOG_DIR/DISK_WARNING            exists while the last check found a problem
+#
+# Environment:
+#   DRY_RUN=1            print every command instead of running it, log to stdout
+#   NO_REBOOT=1          do everything except the final reboot
+#   LOG_DIR, DISK        override the log directory / the disk to check
+#   DIETPI_BACKUP        path of dietpi-backup (tests point it at a fake)
+#   WAKE_AFTER_REBOOT    0/1 to force the wake-up mode instead of detecting it
+#   NOTIFY               path of the ntfy-notify helper (default /usr/local/bin/ntfy-notify)
+#   REPORTS              path of machine-reports (default /usr/local/bin/machine-reports)
+#   DOCKER               path of the docker binary (tests point it at a fake)
+#   CONTAINER_HEALTH_WAIT  seconds a recreated container gets to become healthy (90)
+
+set -u
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"   # smartctl lives in /usr/sbin
+export DEBIAN_FRONTEND=noninteractive                 # never wait for a dpkg prompt
+
+DRY_RUN="${DRY_RUN:-0}"
+NO_REBOOT="${NO_REBOOT:-0}"
+LOG_DIR="${LOG_DIR:-/mnt/dietpi_userdata/logs}"
+DISK="${DISK:-/dev/sda}"
+DIETPI_BACKUP="${DIETPI_BACKUP:-/boot/dietpi/dietpi-backup}"
+BACKUP_SERVER_MAC="02:00:00:00:00:30"   # pulls /mnt/dietpi-backup from here
+BACKUP_SERVER_IP="192.168.50.30"
+BACKUP_SERVER_WAS_ON=0
+NOTIFY="${NOTIFY:-/usr/local/bin/ntfy-notify}"   # push notifications, see README "Notifications"
+REPORTS="${REPORTS:-/usr/local/bin/machine-reports}"   # sends the weekly push once the backup server reported
+BACKUP_SERVER_WOKEN=0
+DOCKER="${DOCKER:-/usr/bin/docker}"
+CONTAINER_HEALTH_WAIT="${CONTAINER_HEALTH_WAIT:-90}"
+UPDATED_CONTAINERS=""
+
+# -y so nothing waits for an answer, and keep our own config files when a package
+# ships a new one (the packaged version lands next to it as *.dpkg-dist).
+APT_OPTS=(-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+APT_UPDATE_TRIES=3
+APT_UPDATE_WAIT=30
+
+FAILURES=0
+CURRENT_STEP="startup"
+FINISHED=0
+
+# --------------------------------------------------------------------------- helpers
+
+# run a command, or only print it in dry-run mode
+run() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "DRY: $*"
+    else
+        "$@"
+    fi
+}
+
+# Run one step. A failure is reported and counted, but never aborts the job.
+run_step() {
+    local name="$1"; shift
+    CURRENT_STEP="$name"
+    # `&&` (not `if`) so $? below is the failed command's status: an `if` block
+    # whose condition fails and which has no else branch itself returns 0.
+    run "$@" && return 0
+    local rc=$?
+    echo "WARNING: $name failed (rc=$rc), continuing"
+    FAILURES=$((FAILURES + 1))
+    return "$rc"
+}
+
+# A single mirror hiccup at 03:30 must not cost the week's updates.
+apt_update() {
+    local try
+    CURRENT_STEP="apt-get update"
+    for try in $(seq 1 "$APT_UPDATE_TRIES"); do
+        if run /usr/bin/apt-get update -q; then
+            return 0
+        fi
+        if [ "$try" -lt "$APT_UPDATE_TRIES" ]; then
+            echo "apt-get update failed (attempt $try/$APT_UPDATE_TRIES), retrying in ${APT_UPDATE_WAIT}s..."
+            [ "$APT_UPDATE_WAIT" -gt 0 ] && sleep "$APT_UPDATE_WAIT"
+        fi
+    done
+    echo "WARNING: apt-get update failed $APT_UPDATE_TRIES times, skipping the upgrade"
+    FAILURES=$((FAILURES + 1))
+    return 1
+}
+
+# One line per run, kept, so an interrupted week leaves a trace too.
+status_line() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "STATUS: $*"
+    else
+        echo "$(date -u '+%Y-%m-%d %H:%M') $*" >> "$LOG_DIR/maintenance-status.log"
+    fi
+}
+
+on_exit() {
+    [ "$FINISHED" = 1 ] && return
+    status_line "aborted during: $CURRENT_STEP"
+    notify high warning "Weekly maintenance aborted" "Aborted during: $CURRENT_STEP. See weekly-updater.log."
+}
+
+# Push one notification: notify PRIORITY TAGS TITLE [MESSAGE]. Optional: when
+# the helper or its config is missing the job only says so in the log.
+notify() {
+    local priority="$1" tags="$2" title="$3"; shift 3
+    if [ "$DRY_RUN" != 1 ] && [ ! -x "$NOTIFY" ]; then
+        echo "note: $NOTIFY not installed, no notification sent ($title)"
+        return 0
+    fi
+    run "$NOTIFY" -p "$priority" -t "$tags" "$title" "$@" || echo "note: notification failed ($title)"
+}
+
+# The weekly push: a quiet "all good" on success (so silence means the job did
+# not run), the WARNING lines at once otherwise. The backup server only runs
+# after this machine's reboot, so when it has been woken and machine-reports is
+# installed, the "all good" is not sent from here: the laptop's part is left in
+# $LOG_DIR/.weekly-summary, and machine-reports sends one push with the backup
+# server's and the desktop's results as soon as the backup server has reported,
+# or at its deadline. Failed steps are pushed straight away and appear in that
+# weekly push again.
+notify_summary() {
+    local disk warnings=""
+    disk=$(tail -1 "$LOG_DIR/disk-health.log" 2>/dev/null | cut -d' ' -f3-)
+    if [ "$FAILURES" -gt 0 ]; then
+        warnings=$(grep '^WARNING' "$LOG_DIR/weekly-updater.log" 2>/dev/null | head -10)
+        notify high warning "Weekly maintenance: $FAILURES failed step(s)" \
+            "${warnings:-see weekly-updater.log}"
+    fi
+    if [ "$BACKUP_SERVER_WOKEN" = 1 ] && [ -x "$REPORTS" ]; then
+        leave_weekly_summary "$disk" "$warnings"
+    elif [ "$FAILURES" -eq 0 ]; then
+        notify low white_check_mark "Weekly maintenance OK" \
+            "Backup, updates and Pi-hole done, rebooting now.${UPDATED_CONTAINERS:+
+Containers updated: $UPDATED_CONTAINERS}${disk:+
+Disk: $disk}"
+    fi
+}
+
+# The laptop's part of the weekly push, for machine-reports (key=value lines).
+leave_weekly_summary() {
+    local disk="$1" warnings="$2"
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "DRY: weekly push left to $REPORTS ($FAILURES failure(s))"
+        return 0
+    fi
+    {
+        echo "created=$(date +%s)"
+        echo "failures=$FAILURES"
+        echo "containers=$UPDATED_CONTAINERS"
+        echo "disk=$disk"
+        echo "warnings=$(printf '%s' "$warnings" | paste -sd'|' | sed 's/|/ | /g')"
+        [ "$BACKUP_SERVER_WAS_ON" = 1 ] && echo "backup_server_was_on=yes"
+    } > "$LOG_DIR/.weekly-summary"
+    echo "Weekly push left to machine-reports: it goes out once the backup server has reported."
+}
+
+# dietpi-backup prints every file rsync deletes, well over a hundred thousand
+# lines a week, and keeps that complete output in its own log anyway
+# (/mnt/dietpi-backup/dietpi-backup.log). Only the summary belongs in
+# weekly-updater.log, or the 500 lines that matter drown. PIPESTATUS keeps
+# dietpi-backup's exit code, not grep's. In dry-run mode `run` prints the command.
+dietpi_backup() {
+    if [ "$DRY_RUN" = 1 ]; then
+        run "$DIETPI_BACKUP" 1
+        return
+    fi
+    "$DIETPI_BACKUP" 1 2>&1 | grep -vE '^(deleting |sending incremental file list$|[^ ]+/[^ ]*$)'
+    return "${PIPESTATUS[0]}"
+}
+
+# Pull the current image of every Docker Compose project on the machine and
+# recreate the containers whose image changed, then drop the old layers.
+# MeTube follows `latest` and ntfy follows `v2`, so both move only within what
+# their authors call compatible. A recreated container that is not healthy
+# (or at least running, if it has no health check) after CONTAINER_HEALTH_WAIT
+# seconds counts as a failure. The reboot at the end restarts everything anyway.
+update_containers() {
+    CURRENT_STEP="container images"
+    echo "--- Container images"
+    if [ ! -x "$DOCKER" ]; then
+        echo "docker is not installed, nothing to update"
+        return 0
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "DRY: $DOCKER compose ls -a --format json"
+        echo "DRY: $DOCKER compose -f <each project> pull --quiet; up -d"
+        echo "DRY: $DOCKER image prune -f"
+        return 0
+    fi
+    local projects name files before after out
+    projects=$("$DOCKER" compose ls -a --format json 2>/dev/null | python3 -c '
+import json, sys
+for p in json.load(sys.stdin):
+    print(p["Name"] + "|" + p["ConfigFiles"])' 2>/dev/null)
+    if [ -z "$projects" ]; then
+        echo "no Compose projects found"
+        return 0
+    fi
+    while IFS='|' read -r name files; do
+        [ -n "$name" ] || continue
+        local -a cf=() parts=()
+        IFS=',' read -ra parts <<< "$files"
+        local f; for f in "${parts[@]}"; do cf+=(-f "$f"); done
+        before=$("$DOCKER" compose "${cf[@]}" images -q 2>/dev/null | sort)
+        if ! out=$("$DOCKER" compose "${cf[@]}" pull --quiet 2>&1); then
+            echo "WARNING: $name: image pull failed, keeping the current image: ${out:-no output}"
+            FAILURES=$((FAILURES + 1))
+            continue
+        fi
+        if ! out=$("$DOCKER" compose "${cf[@]}" up -d 2>&1); then
+            echo "WARNING: $name: recreating the container failed: ${out:-no output}"
+            FAILURES=$((FAILURES + 1))
+            continue
+        fi
+        after=$("$DOCKER" compose "${cf[@]}" images -q 2>/dev/null | sort)
+        if [ "$before" != "$after" ]; then
+            echo "$name: image updated"
+            UPDATED_CONTAINERS="${UPDATED_CONTAINERS:+$UPDATED_CONTAINERS }$name"
+            wait_healthy "$name" "${cf[@]}"
+        else
+            echo "$name: already current"
+        fi
+    done <<< "$projects"
+    "$DOCKER" image prune -f >/dev/null 2>&1 || echo "note: could not prune old images"
+}
+
+# wait_healthy NAME -f FILE... : give a recreated project time to come up
+wait_healthy() {
+    local name="$1"; shift
+    local waited=0 cid state bad
+    while :; do
+        bad=""
+        for cid in $("$DOCKER" compose "$@" ps -q 2>/dev/null); do
+            state=$("$DOCKER" inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null)
+            case "$state" in healthy|running) ;; *) bad="${state:-gone}" ;; esac
+        done
+        if [ -z "$bad" ]; then
+            echo "$name: healthy"
+            return 0
+        fi
+        [ "$waited" -ge "$CONTAINER_HEALTH_WAIT" ] && break
+        sleep 5
+        waited=$((waited + 5))
+    done
+    echo "WARNING: $name is '$bad' ${waited}s after the update"
+    FAILURES=$((FAILURES + 1))
+    return 1
+}
+
+# print a number, or 0 when the input is not a plain number
+num() {
+    if [[ "${1:-}" =~ ^[0-9]+$ ]]; then echo "$1"; else echo 0; fi
+}
+
+# Is the boot-time wake-up unit installed? WAKE_AFTER_REBOOT=0/1 overrides (tests).
+wake_after_reboot() {
+    case "${WAKE_AFTER_REBOOT:-auto}" in
+        1) return 0 ;;
+        0) return 1 ;;
+        *) systemctl is-enabled wake-backup-server.service >/dev/null 2>&1 ;;
+    esac
+}
+
+# installed kernel images except the running one and the newest one
+old_kernels() {
+    local running newest k
+    local -a installed
+    running="linux-image-$(uname -r)"
+    # Only installed packages count. dpkg also lists names it merely knows, such as
+    # the -unsigned builds, and one of those sorting last made the newest installed
+    # kernel look old: found 1 October 2026, before Sunday's run would have purged
+    # 6.12.111, a security update, and the linux-image-amd64 that depends on it.
+    mapfile -t installed < <(dpkg-query -W -f='${Package} ${db:Status-Status}\n' 'linux-image-[0-9]*' 2>/dev/null \
+        | awk '$2 == "installed" {print $1}' | sort -V)
+    [ "${#installed[@]}" -gt 0 ] || return 0
+    newest=${installed[-1]}
+    for k in "${installed[@]}"; do
+        if [ "$k" != "$running" ] && [ "$k" != "$newest" ]; then echo "$k"; fi
+    done
+}
+
+disk_health() {
+    CURRENT_STEP="disk health"
+    echo "--- Disk health ($DISK)"
+    if ! command -v smartctl >/dev/null 2>&1; then
+        echo "smartmontools is missing, installing it..."
+        run /usr/bin/apt-get "${APT_OPTS[@]}" install smartmontools
+        if ! command -v smartctl >/dev/null 2>&1 && [ "$DRY_RUN" != 1 ]; then
+            echo "WARNING: could not install smartmontools, skipping the disk check"
+            FAILURES=$((FAILURES + 1))
+            return
+        fi
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "DRY: smartctl -H -A -l selftest $DISK"
+        echo "DRY: smartctl -t short $DISK"
+        return
+    fi
+
+    local out health realloc pending uncorr hours temp last_test
+    out=$(smartctl -H -A -l selftest "$DISK" 2>&1)
+    health=$(echo "$out" | awk -F: '/SMART overall-health/ {gsub(/ /, "", $2); print $2}')
+    attr() { echo "$out" | awk -v id="$1" '$1 == id {print $10; exit}'; }
+    realloc=$(num "$(attr 5)")
+    pending=$(num "$(attr 197)")
+    uncorr=$(num "$(attr 198)")
+    hours=$(num "$(attr 9)")
+    temp=$(num "$(attr 194)")
+    last_test=$(echo "$out" | awk '/^# 1 / {$1=$2=""; sub(/^ +/, ""); print; exit}')
+
+    local line="health=${health:-unknown} reallocated=$realloc pending=$pending uncorrectable=$uncorr power_on_hours=$hours temp=${temp}C last_selftest=[${last_test:-none}]"
+    echo "$line"
+    echo "$(date -u '+%Y-%m-%d %H:%M') $line" >> "$LOG_DIR/disk-health.log"
+
+    if [ "${health:-}" != "PASSED" ] || [ "$realloc" -gt 0 ] || [ "$pending" -gt 0 ] || [ "$uncorr" -gt 0 ]; then
+        echo "WARNING: $DISK shows problems (health=$health reallocated=$realloc pending=$pending uncorrectable=$uncorr). Plan a replacement and move the backups off this disk."
+        touch "$LOG_DIR/DISK_WARNING"
+        FAILURES=$((FAILURES + 1))
+        notify urgent rotating_light "Disk $DISK reports problems" \
+            "health=${health:-unknown} reallocated=$realloc pending=$pending uncorrectable=$uncorr. Plan a replacement and move the backups off this disk."
+    else
+        rm -f "$LOG_DIR/DISK_WARNING"
+    fi
+
+    # start a short self-test (about 2 minutes, runs in the drive); its result
+    # shows up as last_selftest next week
+    smartctl -t short "$DISK" >/dev/null 2>&1 || echo "note: could not start a SMART self-test"
+}
+
+# --------------------------------------------------------------------------- main
+
+main() {
+    trap on_exit EXIT
+    echo "=== Process started at $(date) ==="
+
+    # --- STEP 1: Backup & Wake-on-LAN ---
+    echo "Starting DietPi backup..."
+    CURRENT_STEP="dietpi-backup"
+    if dietpi_backup; then
+        if wake_after_reboot; then
+            echo "Backup successful. The backup server will be woken after the reboot (wake-backup-server.service)."
+            run touch "$LOG_DIR/.wake-backup-server"
+        else
+            echo "Backup successful. Waking the backup server now (install wake-backup-server.service to do it after the reboot instead)..."
+            # meant to be off: if it answers, this week's run will not start (see wake-backup-server)
+            if [ "$DRY_RUN" != 1 ] && ping -c 2 -W 2 "$BACKUP_SERVER_IP" >/dev/null 2>&1; then
+                echo "WARNING: the backup server ($BACKUP_SERVER_IP) was already on, so its weekly run will not start"
+                BACKUP_SERVER_WAS_ON=1
+            fi
+            run /usr/bin/wakeonlan "$BACKUP_SERVER_MAC"
+        fi
+        BACKUP_SERVER_WOKEN=1
+    else
+        rc=$?
+        echo "WARNING: dietpi-backup failed (rc=$rc), continuing"
+        FAILURES=$((FAILURES + 1))
+        echo "Not waking the backup server after a failed backup; continuing with updates..."
+    fi
+
+    # --- STEP 2: Disk health ---
+    disk_health
+
+    # --- STEP 3: DietPi & OS Package Updates ---
+    echo "Updating DietPi framework..."
+    run_step "dietpi-update" /boot/dietpi/dietpi-update 1
+    echo "Updating APT system packages..."
+    if apt_update; then
+        run_step "dist-upgrade" /usr/bin/apt-get "${APT_OPTS[@]}" dist-upgrade
+    fi
+
+    # --- STEP 4: Cleanup ---
+    CURRENT_STEP="kernel cleanup"
+    echo "Removing old kernels (keeping $(uname -r) and the newest installed)..."
+    mapfile -t OLD_KERNELS < <(old_kernels)
+    if [ "${#OLD_KERNELS[@]}" -gt 0 ]; then
+        echo "  purging: ${OLD_KERNELS[*]}"
+        run_step "kernel purge" /usr/bin/apt-get "${APT_OPTS[@]}" purge "${OLD_KERNELS[@]}"
+    else
+        echo "  nothing to purge"
+    fi
+    echo "Cleaning package cache..."
+    run_step "autoremove" /usr/bin/apt-get "${APT_OPTS[@]}" autoremove --purge
+    run /usr/bin/apt-get -q clean
+
+    # --- STEP 5: Pi-hole Updates ---
+    echo "Updating Pi-hole..."
+    run_step "pihole -up" /usr/local/bin/pihole -up
+    run_step "pihole -g" /usr/local/bin/pihole -g
+
+    # --- STEP 6: Container images ---
+    update_containers
+
+    # --- STEP 7: Reboot ---
+    CURRENT_STEP="reboot"
+    if [ "$FAILURES" -eq 0 ]; then
+        echo "=== Process finished successfully at $(date) ==="
+    else
+        echo "=== Process finished at $(date) with $FAILURES failed step(s), see the WARNING lines above ==="
+    fi
+    status_line "finished, $FAILURES failure(s)"
+    FINISHED=1
+    notify_summary
+
+    if [ "$NO_REBOOT" = 1 ]; then
+        echo "NO_REBOOT set, not rebooting."
+        return
+    fi
+    echo "Rebooting system in 5 seconds..."
+    run sleep 5
+    run /sbin/reboot
+}
+
+# Sourcing the script defines the helpers without running anything (tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    mkdir -p "$LOG_DIR"
+
+    # One maintenance run at a time (cron plus a manual run, or a very slow week).
+    exec 9>"$LOG_DIR/.maintenance.lock"
+    if ! flock -n 9; then
+        echo "another maintenance run is already in progress, exiting" >&2
+        exit 0
+    fi
+
+    if [ "$DRY_RUN" = 1 ]; then
+        main
+    else
+        main > "$LOG_DIR/weekly-updater.log" 2>&1
+    fi
+    exit $(( FAILURES > 0 ? 1 : 0 ))
+fi

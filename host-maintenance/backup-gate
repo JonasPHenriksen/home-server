@@ -1,0 +1,152 @@
+#!/bin/bash
+#
+# backup-gate - the only command the backup server's and the desktop's keys may
+# run on this laptop. Installed as /usr/local/bin/backup-gate and named as the
+# forced command in their authorized_keys (backup-logins/), so whatever the
+# other machine asks for arrives here in SSH_ORIGINAL_COMMAND, and only what is
+# listed below is done. Versioned in the host-maintenance repo.
+#
+#   backup-gate pull   the backup server, logged in as `backup-server`
+#   backup-gate push   the desktop, logged in as `desktop`
+#
+# Both used to log in as dietpi and run `sudo rsync` with no password and no
+# limits, which made every dietpi login root. Now each machine gets exactly its
+# job, and the root part goes through rrsync, rsync's own restricted server,
+# which checks every option and path:
+#
+#   pull   read the three backup trees (rrsync -ro, as root), send the heartbeat
+#          and the run report, ask the uptime, read its own install files
+#   push   write the desktop's two mirrors (rrsync -wo, as root), send the run
+#          report, read its own install files
+#
+# Every rrsync is confined to the one folder the request is for (the tree, or
+# the role's install folder), and the path it is given becomes relative to it.
+# So even a request that got past the checks here could not leave that folder.
+#
+# The heartbeat and the reports are written by this script itself, to fixed
+# paths, from stdin: the command the client sends is only compared, never run.
+# Anything else is refused and logged to the journal (tag backup-gate).
+#
+# Each role is also tied to its machine's address: dropbear has no from= option
+# for authorized_keys, but it tells the session where the client is (SSH_CLIENT),
+# so a copied key is no use from anywhere else.
+#
+# Environment (the tests point these at a scratch tree and fakes):
+#   SUDO LOGGER RRSYNC LOGS REPO PULL_TREES PUSH_TREES GATE_FROM
+#
+set -u
+set -f      # the command is split into words below; never let a * expand
+
+ROLE="${1:-}"
+CMD="${SSH_ORIGINAL_COMMAND:-}"
+SUDO="${SUDO-sudo -n}"
+LOGGER="${LOGGER:-logger}"
+RRSYNC="${RRSYNC:-/usr/bin/rrsync}"
+LOGS="${LOGS:-/mnt/dietpi_userdata/logs}"
+REPO="${REPO:-/home/dietpi/host-maintenance}"
+PULL_TREES="${PULL_TREES:-/mnt/dietpi-backup/data/ /mnt/dietpi-desktop-backup/ /mnt/dietpi-desktop-nextcloud-backup/}"
+PUSH_TREES="${PUSH_TREES:-/mnt/dietpi-desktop-backup/ /mnt/dietpi-desktop-nextcloud-backup/}"
+REPORT_NAME='report-[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}(-[0-9]{2})?\.txt'
+
+refuse() {
+    $LOGGER -t backup-gate "refused ($ROLE): ${CMD:0:300}" 2>/dev/null || true
+    echo "backup-gate: not allowed: $1" >&2
+    exit 1
+}
+
+# Write stdin to FILE through a temp name in the same directory, so a reader
+# never sees half a file.
+receive() {
+    local file="$1" tmp
+    tmp="$(dirname "$file")/.$(basename "$file").incoming"
+    cat > "$tmp" && mv -f "$tmp" "$file"
+}
+
+# The exact commands the two clients send for their files (pull-backups.sh and
+# dietpi-backup-sync.sh build them the same way).
+heartbeat_cmd() { echo "cat > '$1.tmp' && mv -f '$1.tmp' '$1'"; }
+report_cmd()    { echo "mkdir -p '$1' && cat > '$1/.$2' && mv -f '$1/.$2' '$1/$2'"; }
+
+# If CMD is a report upload into DIR, print the report's name.
+report_name() {
+    local name="${CMD##*/}"         # the last path component
+    name="${name%\'}"
+    [[ $name =~ ^$REPORT_NAME$ ]] && [ "$CMD" = "$(report_cmd "$1" "$name")" ] && echo "$name"
+}
+
+words()    { local a=($CMD); printf '%s\n' "${a[@]}"; }
+last_arg() { words | tail -n 1; }
+# The command without its path, plus NEW_PATH: what rrsync gets once it is
+# confined to a folder and the path is relative to it.
+with_path() { echo "$(words | head -n -1 | paste -sd' ') $1"; }
+# rsync's server command is OPTIONS . PATH...: the first lone "." ends the
+# options and every word after it is a path (rrsync reads it the same way). One
+# path only, so "." must be the second-to-last word and the only lone "." at all:
+# ". /etc/shadow . TREE" ends in ". TREE" too.
+one_path() {
+    local w dots=0
+    for w in $CMD; do [ "$w" = . ] && dots=$((dots + 1)); done
+    [ "$dots" = 1 ] && [ "$(words | tail -n 2 | head -n 1)" = . ] || refuse "one path at a time"
+}
+in_list()  { local item; for item in $2; do [ "$1" = "$item" ] && return 0; done; return 1; }
+
+# An install read: rsync --sender of a file below REPO/SUBDIR, as this login, no sudo.
+install_read() {
+    local path
+    one_path
+    path=$(last_arg)
+    case "$path" in
+        *..*) refuse "no .. in install paths" ;;
+        "$REPO/$1/"?*) exec env SSH_ORIGINAL_COMMAND="$(with_path "${path#"$REPO/$1/"}")" "$RRSYNC" -ro "$REPO/$1" ;;
+    esac
+    return 1
+}
+
+case "$ROLE" in
+    pull) FROM="${GATE_FROM:-192.168.50.30}" ;;     # the backup server
+    push) FROM="${GATE_FROM:-192.168.50.20}" ;;     # the desktop
+    *)    refuse "unknown role '$ROLE'" ;;
+esac
+CLIENT="${SSH_CLIENT:-}"
+[ "${CLIENT%% *}" = "$FROM" ] || refuse "this key works only from $FROM"
+[ -n "$CMD" ] || refuse "no command (an interactive login)"
+[ "$CMD" = true ] && exit 0
+
+case "$ROLE" in
+    pull)
+        dir="$LOGS/backup-server"
+        if [ "$CMD" = "cut -d. -f1 /proc/uptime" ]; then
+            exec cut -d. -f1 /proc/uptime
+        elif [ "$CMD" = "$(heartbeat_cmd "$dir/heartbeat")" ]; then
+            receive "$dir/heartbeat"; exit
+        elif name=$(report_name "$dir"); then
+            receive "$dir/$name"; exit
+        elif [[ $CMD == "rsync --server --sender "* ]]; then
+            install_read backup-server
+            one_path
+            tree=$(last_arg)
+            in_list "$tree" "$PULL_TREES" || refuse "not one of the backup trees"
+            # rrsync -ro TREE takes paths relative to TREE, so the tree itself is "."
+            exec env SSH_ORIGINAL_COMMAND="$(with_path .)" $SUDO "$RRSYNC" -ro "${tree%/}"
+        fi
+        ;;
+    push)
+        dir="$LOGS/desktop"
+        if name=$(report_name "$dir"); then
+            receive "$dir/$name"; exit
+        elif [[ $CMD == "rsync --server --sender "* ]]; then
+            install_read desktop || refuse "the desktop may read only its own install files"
+        elif [[ $CMD == "rsync --server "* ]]; then
+            one_path
+            tree=$(last_arg)
+            in_list "$tree" "$PUSH_TREES" || refuse "not one of the desktop's mirrors"
+            # rrsync -wo DIR takes paths relative to DIR, so the mirror itself is "."
+            exec env SSH_ORIGINAL_COMMAND="$(with_path .)" $SUDO "$RRSYNC" -wo "${tree%/}"
+        fi
+        ;;
+    *)
+        refuse "unknown role '$ROLE'"
+        ;;
+esac
+
+refuse "unknown command"

@@ -1,0 +1,30 @@
+# Open WebUI, managed by docker compose so weekly updates are a plain "pull + up -d".
+# Secret key lives in .env next to this file (root-only). Data is the pre-existing named volume "open-webui".
+#
+# "name:" pins the compose project name. Without it the project name is derived from the invocation
+# (working directory / project directory), and a run from a different cwd loses track of the existing
+# container and fails with a name conflict instead of recreating it.
+name: open-webui
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: always
+    # default docker0 bridge, not a compose-private network: the UFW rule allowing Ollama (11434) is bound to docker0
+    network_mode: bridge
+    # localhost only: Apache serves it over HTTPS on 3443 (open-webui-ssl.conf), and the weekly job's smoke
+    # test uses http://127.0.0.1:3000/
+    ports:
+      - "127.0.0.1:3000:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY missing - is /opt/open-webui/.env being read?}
+    volumes:
+      - open-webui:/app/backend/data
+
+volumes:
+  open-webui:
+    external: true

@@ -1,0 +1,3 @@
+# Nextcloud's database setup check (since 35) wants at least 128 MB; MariaDB's default is 96 MB.
+[mysqld]
+innodb_log_file_size = 256M

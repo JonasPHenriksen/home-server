@@ -1,0 +1,13 @@
+[Unit]
+Description=Motion Detection Service for Tapo Security Cameras
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dietpi/tapo-automation
+ExecStart=/home/dietpi/tapo-automation/check_phones_loop.sh
+Restart=always
+User=dietpi
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Read the backup server's and the desktop's reports and push what matters
+Documentation=file:///home/dietpi/host-maintenance/README.md
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/machine-reports
+Nice=10

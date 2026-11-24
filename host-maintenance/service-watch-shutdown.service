@@ -1,0 +1,22 @@
+[Unit]
+Description=Tell service-watch that this shutdown was a clean one
+Documentation=file:///home/dietpi/host-maintenance/README.md
+# Same shape as archive-journal-shutdown.service: RemainAfterExit plus a
+# do-nothing ExecStart make this a pure shutdown hook that works in ExecStop.
+# A power cut never gets this far, which is how the first run of service-watch
+# after the next boot tells the two apart.
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/service-watch --shutdown
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
